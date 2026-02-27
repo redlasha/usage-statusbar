@@ -1,0 +1,97 @@
+import { readFileSync } from "fs";
+import { execSync } from "child_process";
+import { join } from "path";
+import { homedir } from "os";
+
+type UsageResponse = {
+  five_hour?: {
+    utilization: number;
+    resets_at: string;
+  };
+  seven_day?: {
+    utilization: number;
+    resets_at: string;
+  };
+};
+
+/**
+ * Get Claude Code OAuth token from credentials file (Linux/Windows)
+ */
+function getTokenFromCredentialsFile(): string | null {
+  try {
+    const credPath = join(homedir(), ".claude", ".credentials.json");
+    const content = readFileSync(credPath, "utf8");
+    const creds = JSON.parse(content);
+    return creds?.claudeAiOauth?.accessToken ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Get Claude Code OAuth token from macOS Keychain
+ */
+function getTokenFromKeychain(): string | null {
+  try {
+    const result = execSync(
+      'security find-generic-password -s "Claude Code-credentials" -w',
+      { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }
+    ).trim();
+    const creds = JSON.parse(result);
+    return creds?.claudeAiOauth?.accessToken ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Get Claude Code OAuth token (credentials file → macOS Keychain fallback)
+ */
+function getToken(): string | null {
+  return getTokenFromCredentialsFile() ?? getTokenFromKeychain();
+}
+
+/**
+ * Fetch usage data from Anthropic API
+ */
+export async function fetchUsage(): Promise<{
+  fiveHourPct: number;
+  fiveHourResetMs: number;
+  fiveHourResetAt: Date | null;
+  sevenDayPct: number;
+} | null> {
+  try {
+    const token = getToken();
+    if (!token) return null;
+
+    const res = await fetch("https://api.anthropic.com/api/oauth/usage", {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "anthropic-beta": "oauth-2025-04-20",
+      },
+    });
+
+    if (!res.ok) return null;
+
+    const data: UsageResponse = await res.json();
+
+    const fiveHourPct = data.five_hour?.utilization ?? 0;
+    const sevenDayPct = data.seven_day?.utilization ?? 0;
+
+    let fiveHourResetMs = 0;
+    let fiveHourResetAt: Date | null = null;
+    if (data.five_hour?.resets_at) {
+      fiveHourResetAt = new Date(data.five_hour.resets_at);
+      fiveHourResetMs = Math.max(0, fiveHourResetAt.getTime() - Date.now());
+    }
+
+    return {
+      fiveHourPct,
+      fiveHourResetMs,
+      fiveHourResetAt,
+      sevenDayPct,
+    };
+  } catch {
+    return null;
+  }
+}

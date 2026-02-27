@@ -1,0 +1,36 @@
+{
+  "name": "usage-statusbar",
+  "version": "1.0.0",
+  "description": "Claude Code statusline showing context window and 5-hour usage with emoji bar graphs",
+  "main": "dist/index.js",
+  "bin": {
+    "usage-statusbar": "dist/index.js"
+  },
+  "scripts": {
+    "build": "bun build src/index.ts --target=node --outfile=dist/index.js",
+    "prepublishOnly": "bun run build",
+    "postinstall": "node dist/index.js --setup"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "keywords": [
+    "claude-code",
+    "statusline",
+    "usage",
+    "context-window",
+    "rate-limit"
+  ],
+  "author": "redlasha",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/redlasha/usage-statusbar.git"
+  },
+  "homepage": "https://github.com/redlasha/usage-statusbar",
+  "type": "module",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}
