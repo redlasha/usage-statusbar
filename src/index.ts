@@ -48,10 +48,10 @@ async function statusline() {
     }
 
     console.log(
-      `🧠 ${contextBar} ${Math.round(contextPct)}% | ⏰ ${blockBar} ${Math.round(usage.fiveHourPct)}% | 🔄 ${resetKST} (-${resetTime})`
+      `🧠${contextBar}${Math.round(contextPct)}% ⏰${blockBar}${Math.round(usage.fiveHourPct)}% 🔄${resetKST}(-${resetTime})`
     );
   } else {
-    console.log(`🧠 ${contextBar} ${Math.round(contextPct)}%`);
+    console.log(`🧠${contextBar}${Math.round(contextPct)}%`);
   }
 }
 
@@ -64,5 +64,5 @@ async function main() {
 }
 
 main().catch(() => {
-  console.log("🧠 ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ --%");
+  console.log("🧠░░░░░--%");
 });

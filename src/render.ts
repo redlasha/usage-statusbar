@@ -6,7 +6,7 @@
  * - Empty:  dim    (░)
  */
 
-const BAR_LENGTH = 10;
+const BAR_LENGTH = 5;
 
 const ANSI = {
   green: "\x1b[32m",

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // src/render.ts
-var BAR_LENGTH = 10;
+var BAR_LENGTH = 5;
 var ANSI = {
   green: "\x1B[32m",
   yellow: "\x1B[33m",
@@ -101,18 +101,8 @@ async function fetchUsage() {
 import { readFileSync as readFileSync2, writeFileSync, mkdirSync, existsSync } from "fs";
 import { join as join2 } from "path";
 import { homedir as homedir2 } from "os";
-import { createInterface } from "readline";
 var SETTINGS_PATH = join2(homedir2(), ".claude", "settings.json");
 var STATUSLINE_COMMAND = "usage-statusbar";
-function ask(question) {
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
-  return new Promise((resolve) => {
-    rl.question(question, (answer) => {
-      rl.close();
-      resolve(answer.trim());
-    });
-  });
-}
 function readSettings() {
   try {
     return JSON.parse(readFileSync2(SETTINGS_PATH, "utf8"));
@@ -128,28 +118,10 @@ function writeSettings(settings) {
   writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2) + `
 `);
 }
-async function setup() {
-  console.log(`
-✔ usage-statusbar 설치 완료!`);
-  if (!process.stdin.isTTY) {
-    console.log(`
-설정 적용:
-  usage-statusbar --setup
-`);
-    return;
-  }
+function applySettings() {
   const settings = readSettings();
   if (settings.statusLine?.command?.includes("usage-statusbar")) {
-    console.log(`✅ statusLine이 이미 설정되어 있습니다.
-`);
-    return;
-  }
-  const answer = await ask("? ~/.claude/settings.json에 statusLine 설정을 추가할까요? (Y/n) ");
-  if (answer.toLowerCase() === "n") {
-    console.log(`
-수동 설정:`);
-    console.log(`  settings.json에 추가: "statusLine": { "type": "command", "command": "${STATUSLINE_COMMAND}" }
-`);
+    console.log("✅ statusLine이 이미 설정되어 있습니다.");
     return;
   }
   settings.statusLine = {
@@ -158,8 +130,11 @@ async function setup() {
     padding: 0
   };
   writeSettings(settings);
-  console.log(`✅ 설정 완료! 다음 Claude Code 세션부터 적용됩니다.
-`);
+  console.log("✅ statusLine 설정 완료! 다음 Claude Code 세션부터 적용됩니다.");
+}
+async function setup() {
+  console.log("✔ usage-statusbar 설치 완료!");
+  applySettings();
 }
 
 // src/index.ts
@@ -190,9 +165,9 @@ async function statusline() {
         hour12: false
       });
     }
-    console.log(`\uD83E\uDDE0 ${contextBar} ${Math.round(contextPct)}% | ⏰ ${blockBar} ${Math.round(usage.fiveHourPct)}% | \uD83D\uDD04 ${resetKST} (-${resetTime})`);
+    console.log(`\uD83E\uDDE0${contextBar}${Math.round(contextPct)}% ⏰${blockBar}${Math.round(usage.fiveHourPct)}% \uD83D\uDD04${resetKST}(-${resetTime})`);
   } else {
-    console.log(`\uD83E\uDDE0 ${contextBar} ${Math.round(contextPct)}%`);
+    console.log(`\uD83E\uDDE0${contextBar}${Math.round(contextPct)}%`);
   }
 }
 async function main() {
@@ -203,5 +178,5 @@ async function main() {
   }
 }
 main().catch(() => {
-  console.log("\uD83E\uDDE0 ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ --%");
+  console.log("\uD83E\uDDE0░░░░░--%");
 });
