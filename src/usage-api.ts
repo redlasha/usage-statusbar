@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, statSync, mkdirSync } from "fs";
+import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { execSync } from "child_process";
 import { join } from "path";
 import { homedir } from "os";
@@ -57,27 +57,39 @@ function getToken(): string | null {
 
 type CachedData = {
   timestamp: number;
+  cooldownUntil?: number;
   response: UsageResponse;
 };
 
-function readCache(staleOk = false): UsageResponse | null {
+function readCache(staleOk = false): CachedData | null {
   try {
     const content = readFileSync(CACHE_FILE, "utf8");
     const cached: CachedData = JSON.parse(content);
     if (!staleOk && Date.now() - cached.timestamp > CACHE_TTL_MS) return null;
-    return cached.response;
+    return cached;
   } catch {
     return null;
   }
 }
 
-function writeCache(response: UsageResponse): void {
+function writeCache(response: UsageResponse, cooldownUntil?: number): void {
   try {
     mkdirSync(CACHE_DIR, { recursive: true });
     const cached: CachedData = { timestamp: Date.now(), response };
+    if (cooldownUntil) cached.cooldownUntil = cooldownUntil;
     writeFileSync(CACHE_FILE, JSON.stringify(cached), "utf8");
   } catch {
     // Ignore write errors
+  }
+}
+
+function isCoolingDown(): boolean {
+  try {
+    const content = readFileSync(CACHE_FILE, "utf8");
+    const cached: CachedData = JSON.parse(content);
+    return !!cached.cooldownUntil && Date.now() < cached.cooldownUntil;
+  } catch {
+    return false;
   }
 }
 
@@ -96,7 +108,7 @@ function parseUsageResponse(data: UsageResponse) {
 }
 
 /**
- * Fetch usage data from Anthropic API (with 30s file-based cache)
+ * Fetch usage data from Anthropic API (with file-based cache)
  */
 export async function fetchUsage(): Promise<{
   fiveHourPct: number;
@@ -105,9 +117,15 @@ export async function fetchUsage(): Promise<{
   sevenDayPct: number;
 } | null> {
   try {
-    // Check cache first
+    // Check cache first (includes cooldown check)
     const cached = readCache();
-    if (cached) return parseUsageResponse(cached);
+    if (cached) return parseUsageResponse(cached.response);
+
+    // During cooldown, skip API call and use stale cache
+    if (isCoolingDown()) {
+      const stale = readCache(true);
+      return stale ? parseUsageResponse(stale.response) : null;
+    }
 
     const token = getToken();
     if (!token) return null;
@@ -121,7 +139,22 @@ export async function fetchUsage(): Promise<{
 
     if (!res.ok) {
       const stale = readCache(true);
-      return stale ? parseUsageResponse(stale) : null;
+      const staleResponse = stale?.response ?? {};
+
+      if (res.status === 429) {
+        const retryAfter = res.headers.get("retry-after");
+        const cooldownMs = retryAfter
+          ? parseInt(retryAfter, 10) * 1000
+          : 600_000; // default 10 minutes
+        writeCache(staleResponse, Date.now() + cooldownMs);
+      } else {
+        // Other errors: refresh timestamp to avoid immediate retry
+        writeCache(staleResponse);
+      }
+
+      return staleResponse.five_hour || staleResponse.seven_day
+        ? parseUsageResponse(staleResponse)
+        : null;
     }
 
     const data: UsageResponse = await res.json();
@@ -129,7 +162,12 @@ export async function fetchUsage(): Promise<{
 
     return parseUsageResponse(data);
   } catch {
+    // Network error: refresh timestamp to avoid hammering
     const stale = readCache(true);
-    return stale ? parseUsageResponse(stale) : null;
+    if (stale) {
+      writeCache(stale.response);
+      return parseUsageResponse(stale.response);
+    }
+    return null;
   }
 }

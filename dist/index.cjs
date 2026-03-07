@@ -10,10 +10,8 @@ var ANSI = {
   reset: "\x1B[0m"
 };
 function getColor(percentage) {
-  if (percentage <= 50)
-    return ANSI.green;
-  if (percentage <= 80)
-    return ANSI.yellow;
+  if (percentage <= 50) return ANSI.green;
+  if (percentage <= 80) return ANSI.yellow;
   return ANSI.red;
 }
 function renderBar(percentage) {
@@ -21,14 +19,13 @@ function renderBar(percentage) {
   const filledCount = Math.round(clampedPct / 100 * BAR_LENGTH);
   const emptyCount = BAR_LENGTH - filledCount;
   const color = getColor(clampedPct);
-  const filled = `${color}${"█".repeat(filledCount)}${ANSI.reset}`;
-  const empty = `${ANSI.dim}${"░".repeat(emptyCount)}${ANSI.reset}`;
+  const filled = `${color}${"\u2588".repeat(filledCount)}${ANSI.reset}`;
+  const empty = `${ANSI.dim}${"\u2591".repeat(emptyCount)}${ANSI.reset}`;
   return filled + empty;
 }
 function formatDuration(ms) {
-  if (ms <= 0)
-    return "0m";
-  const totalMinutes = Math.floor(ms / 60000);
+  if (ms <= 0) return "0m";
+  const totalMinutes = Math.floor(ms / 6e4);
   const hours = Math.floor(totalMinutes / 60);
   const minutes = totalMinutes % 60;
   if (hours > 0) {
@@ -38,17 +35,17 @@ function formatDuration(ms) {
 }
 
 // src/usage-api.ts
-import { readFileSync, writeFileSync, mkdirSync } from "fs";
-import { execSync } from "child_process";
-import { join } from "path";
-import { homedir } from "os";
-var CACHE_TTL_MS = 300000;
-var CACHE_DIR = join(homedir(), ".claude");
-var CACHE_FILE = join(CACHE_DIR, ".usage-statusbar-cache.json");
+var import_fs = require("fs");
+var import_child_process = require("child_process");
+var import_path = require("path");
+var import_os = require("os");
+var CACHE_TTL_MS = 3e5;
+var CACHE_DIR = (0, import_path.join)((0, import_os.homedir)(), ".claude");
+var CACHE_FILE = (0, import_path.join)(CACHE_DIR, ".usage-statusbar-cache.json");
 function getTokenFromCredentialsFile() {
   try {
-    const credPath = join(homedir(), ".claude", ".credentials.json");
-    const content = readFileSync(credPath, "utf8");
+    const credPath = (0, import_path.join)((0, import_os.homedir)(), ".claude", ".credentials.json");
+    const content = (0, import_fs.readFileSync)(credPath, "utf8");
     const creds = JSON.parse(content);
     return creds?.claudeAiOauth?.accessToken ?? null;
   } catch {
@@ -57,7 +54,10 @@ function getTokenFromCredentialsFile() {
 }
 function getTokenFromKeychain() {
   try {
-    const result = execSync('security find-generic-password -s "Claude Code-credentials" -w', { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }).trim();
+    const result = (0, import_child_process.execSync)(
+      'security find-generic-password -s "Claude Code-credentials" -w',
+      { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }
+    ).trim();
     const creds = JSON.parse(result);
     return creds?.claudeAiOauth?.accessToken ?? null;
   } catch {
@@ -69,21 +69,31 @@ function getToken() {
 }
 function readCache(staleOk = false) {
   try {
-    const content = readFileSync(CACHE_FILE, "utf8");
+    const content = (0, import_fs.readFileSync)(CACHE_FILE, "utf8");
     const cached = JSON.parse(content);
-    if (!staleOk && Date.now() - cached.timestamp > CACHE_TTL_MS)
-      return null;
-    return cached.response;
+    if (!staleOk && Date.now() - cached.timestamp > CACHE_TTL_MS) return null;
+    return cached;
   } catch {
     return null;
   }
 }
-function writeCache(response) {
+function writeCache(response, cooldownUntil) {
   try {
-    mkdirSync(CACHE_DIR, { recursive: true });
+    (0, import_fs.mkdirSync)(CACHE_DIR, { recursive: true });
     const cached = { timestamp: Date.now(), response };
-    writeFileSync(CACHE_FILE, JSON.stringify(cached), "utf8");
-  } catch {}
+    if (cooldownUntil) cached.cooldownUntil = cooldownUntil;
+    (0, import_fs.writeFileSync)(CACHE_FILE, JSON.stringify(cached), "utf8");
+  } catch {
+  }
+}
+function isCoolingDown() {
+  try {
+    const content = (0, import_fs.readFileSync)(CACHE_FILE, "utf8");
+    const cached = JSON.parse(content);
+    return !!cached.cooldownUntil && Date.now() < cached.cooldownUntil;
+  } catch {
+    return false;
+  }
 }
 function parseUsageResponse(data) {
   const fiveHourPct = data.five_hour?.utilization ?? 0;
@@ -99,11 +109,13 @@ function parseUsageResponse(data) {
 async function fetchUsage() {
   try {
     const cached = readCache();
-    if (cached)
-      return parseUsageResponse(cached);
+    if (cached) return parseUsageResponse(cached.response);
+    if (isCoolingDown()) {
+      const stale = readCache(true);
+      return stale ? parseUsageResponse(stale.response) : null;
+    }
     const token = getToken();
-    if (!token)
-      return null;
+    if (!token) return null;
     const res = await fetch("https://api.anthropic.com/api/oauth/usage", {
       headers: {
         Authorization: `Bearer ${token}`,
@@ -112,42 +124,53 @@ async function fetchUsage() {
     });
     if (!res.ok) {
       const stale = readCache(true);
-      return stale ? parseUsageResponse(stale) : null;
+      const staleResponse = stale?.response ?? {};
+      if (res.status === 429) {
+        const retryAfter = res.headers.get("retry-after");
+        const cooldownMs = retryAfter ? parseInt(retryAfter, 10) * 1e3 : 6e5;
+        writeCache(staleResponse, Date.now() + cooldownMs);
+      } else {
+        writeCache(staleResponse);
+      }
+      return staleResponse.five_hour || staleResponse.seven_day ? parseUsageResponse(staleResponse) : null;
     }
     const data = await res.json();
     writeCache(data);
     return parseUsageResponse(data);
   } catch {
     const stale = readCache(true);
-    return stale ? parseUsageResponse(stale) : null;
+    if (stale) {
+      writeCache(stale.response);
+      return parseUsageResponse(stale.response);
+    }
+    return null;
   }
 }
 
 // src/setup.ts
-import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, existsSync } from "fs";
-import { join as join2 } from "path";
-import { homedir as homedir2 } from "os";
-var SETTINGS_PATH = join2(homedir2(), ".claude", "settings.json");
+var import_fs2 = require("fs");
+var import_path2 = require("path");
+var import_os2 = require("os");
+var SETTINGS_PATH = (0, import_path2.join)((0, import_os2.homedir)(), ".claude", "settings.json");
 var STATUSLINE_COMMAND = "usage-statusbar";
 function readSettings() {
   try {
-    return JSON.parse(readFileSync2(SETTINGS_PATH, "utf8"));
+    return JSON.parse((0, import_fs2.readFileSync)(SETTINGS_PATH, "utf8"));
   } catch {
     return {};
   }
 }
 function writeSettings(settings) {
-  const dir = join2(homedir2(), ".claude");
-  if (!existsSync(dir)) {
-    mkdirSync2(dir, { recursive: true });
+  const dir = (0, import_path2.join)((0, import_os2.homedir)(), ".claude");
+  if (!(0, import_fs2.existsSync)(dir)) {
+    (0, import_fs2.mkdirSync)(dir, { recursive: true });
   }
-  writeFileSync2(SETTINGS_PATH, JSON.stringify(settings, null, 2) + `
-`);
+  (0, import_fs2.writeFileSync)(SETTINGS_PATH, JSON.stringify(settings, null, 2) + "\n");
 }
 function applySettings() {
   const settings = readSettings();
   if (settings.statusLine?.command?.includes("usage-statusbar")) {
-    console.log("✅ statusLine이 이미 설정되어 있습니다.");
+    console.log("\u2705 statusLine\uC774 \uC774\uBBF8 \uC124\uC815\uB418\uC5B4 \uC788\uC2B5\uB2C8\uB2E4.");
     return;
   }
   settings.statusLine = {
@@ -156,21 +179,21 @@ function applySettings() {
     padding: 0
   };
   writeSettings(settings);
-  console.log("✅ statusLine 설정 완료! 다음 Claude Code 세션부터 적용됩니다.");
+  console.log("\u2705 statusLine \uC124\uC815 \uC644\uB8CC! \uB2E4\uC74C Claude Code \uC138\uC158\uBD80\uD130 \uC801\uC6A9\uB429\uB2C8\uB2E4.");
 }
 async function setup() {
-  console.log("✔ usage-statusbar 설치 완료!");
+  console.log("\u2714 usage-statusbar \uC124\uCE58 \uC644\uB8CC!");
   applySettings();
 }
 async function remove() {
   const settings = readSettings();
   if (!settings.statusLine?.command?.includes("usage-statusbar")) {
-    console.log("ℹ️ statusLine 설정이 존재하지 않습니다.");
+    console.log("\u2139\uFE0F statusLine \uC124\uC815\uC774 \uC874\uC7AC\uD558\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4.");
     return;
   }
   delete settings.statusLine;
   writeSettings(settings);
-  console.log("✅ statusLine 설정이 제거되었습니다. 다음 Claude Code 세션부터 적용됩니다.");
+  console.log("\u2705 statusLine \uC124\uC815\uC774 \uC81C\uAC70\uB418\uC5C8\uC2B5\uB2C8\uB2E4. \uB2E4\uC74C Claude Code \uC138\uC158\uBD80\uD130 \uC801\uC6A9\uB429\uB2C8\uB2E4.");
 }
 
 // src/index.ts
@@ -185,7 +208,8 @@ async function statusline() {
     if (stdinText.trim()) {
       input = JSON.parse(stdinText);
     }
-  } catch {}
+  } catch {
+  }
   const contextPct = input.context_window?.used_percentage ?? 0;
   const contextBar = renderBar(contextPct);
   const usage = await fetchUsage();
@@ -201,9 +225,11 @@ async function statusline() {
         hour12: false
       });
     }
-    console.log(`\uD83E\uDDE0 ${contextBar}${Math.round(contextPct)}% ⏰ ${blockBar}${Math.round(usage.fiveHourPct)}% \uD83D\uDD04 ${resetKST}(-${resetTime})`);
+    console.log(
+      `\u{1F9E0} ${contextBar}${Math.round(contextPct)}% \u23F0 ${blockBar}${Math.round(usage.fiveHourPct)}% \u{1F504} ${resetKST}(-${resetTime})`
+    );
   } else {
-    console.log(`\uD83E\uDDE0 ${contextBar}${Math.round(contextPct)}%`);
+    console.log(`\u{1F9E0} ${contextBar}${Math.round(contextPct)}%`);
   }
 }
 async function main() {
@@ -216,5 +242,5 @@ async function main() {
   }
 }
 main().catch(() => {
-  console.log("\uD83E\uDDE0 ░░░░░--%");
+  console.log("\u{1F9E0} \u2591\u2591\u2591\u2591\u2591--%");
 });
