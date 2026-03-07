@@ -38,7 +38,7 @@ function formatDuration(ms) {
 }
 
 // src/usage-api.ts
-import { readFileSync, writeFileSync, statSync, mkdirSync } from "fs";
+import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { execSync } from "child_process";
 import { join } from "path";
 import { homedir } from "os";
@@ -67,14 +67,11 @@ function getTokenFromKeychain() {
 function getToken() {
   return getTokenFromCredentialsFile() ?? getTokenFromKeychain();
 }
-function readCache() {
+function readCache(staleOk = false) {
   try {
-    const stat = statSync(CACHE_FILE);
-    if (Date.now() - stat.mtimeMs > CACHE_TTL_MS)
-      return null;
     const content = readFileSync(CACHE_FILE, "utf8");
     const cached = JSON.parse(content);
-    if (Date.now() - cached.timestamp > CACHE_TTL_MS)
+    if (!staleOk && Date.now() - cached.timestamp > CACHE_TTL_MS)
       return null;
     return cached.response;
   } catch {
@@ -113,13 +110,16 @@ async function fetchUsage() {
         "anthropic-beta": "oauth-2025-04-20"
       }
     });
-    if (!res.ok)
-      return null;
+    if (!res.ok) {
+      const stale = readCache(true);
+      return stale ? parseUsageResponse(stale) : null;
+    }
     const data = await res.json();
     writeCache(data);
     return parseUsageResponse(data);
   } catch {
-    return null;
+    const stale = readCache(true);
+    return stale ? parseUsageResponse(stale) : null;
   }
 }
 

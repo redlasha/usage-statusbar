@@ -60,13 +60,11 @@ type CachedData = {
   response: UsageResponse;
 };
 
-function readCache(): UsageResponse | null {
+function readCache(staleOk = false): UsageResponse | null {
   try {
-    const stat = statSync(CACHE_FILE);
-    if (Date.now() - stat.mtimeMs > CACHE_TTL_MS) return null;
     const content = readFileSync(CACHE_FILE, "utf8");
     const cached: CachedData = JSON.parse(content);
-    if (Date.now() - cached.timestamp > CACHE_TTL_MS) return null;
+    if (!staleOk && Date.now() - cached.timestamp > CACHE_TTL_MS) return null;
     return cached.response;
   } catch {
     return null;
@@ -121,13 +119,17 @@ export async function fetchUsage(): Promise<{
       },
     });
 
-    if (!res.ok) return null;
+    if (!res.ok) {
+      const stale = readCache(true);
+      return stale ? parseUsageResponse(stale) : null;
+    }
 
     const data: UsageResponse = await res.json();
     writeCache(data);
 
     return parseUsageResponse(data);
   } catch {
-    return null;
+    const stale = readCache(true);
+    return stale ? parseUsageResponse(stale) : null;
   }
 }
