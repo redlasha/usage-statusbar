@@ -2,7 +2,7 @@
 
 import { renderBar, formatDuration } from "./render";
 import { fetchUsage } from "./usage-api";
-import { setup } from "./setup";
+import { setup, remove } from "./setup";
 
 type StatusLineInput = {
   context_window?: {
@@ -48,21 +48,23 @@ async function statusline() {
     }
 
     console.log(
-      `🧠${contextBar}${Math.round(contextPct)}% ⏰${blockBar}${Math.round(usage.fiveHourPct)}% 🔄${resetKST}(-${resetTime})`
+      `🧠 ${contextBar}${Math.round(contextPct)}% ⏰ ${blockBar}${Math.round(usage.fiveHourPct)}% 🔄 ${resetKST}(-${resetTime})`
     );
   } else {
-    console.log(`🧠${contextBar}${Math.round(contextPct)}%`);
+    console.log(`🧠 ${contextBar}${Math.round(contextPct)}%`);
   }
 }
 
 async function main() {
   if (process.argv.includes("--setup")) {
     await setup();
+  } else if (process.argv.includes("--remove")) {
+    await remove();
   } else {
     await statusline();
   }
 }
 
 main().catch(() => {
-  console.log("🧠░░░░░--%");
+  console.log("🧠 ░░░░░--%");
 });

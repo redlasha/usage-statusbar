@@ -43,3 +43,16 @@ export async function setup(): Promise<void> {
   console.log("✔ usage-statusbar 설치 완료!");
   applySettings();
 }
+
+export async function remove(): Promise<void> {
+  const settings = readSettings();
+
+  if (!settings.statusLine?.command?.includes("usage-statusbar")) {
+    console.log("ℹ️ statusLine 설정이 존재하지 않습니다.");
+    return;
+  }
+
+  delete settings.statusLine;
+  writeSettings(settings);
+  console.log("✅ statusLine 설정이 제거되었습니다. 다음 Claude Code 세션부터 적용됩니다.");
+}

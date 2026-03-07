@@ -1,7 +1,11 @@
-import { readFileSync } from "fs";
+import { readFileSync, writeFileSync, statSync, mkdirSync } from "fs";
 import { execSync } from "child_process";
 import { join } from "path";
 import { homedir } from "os";
+
+const CACHE_TTL_MS = 300_000; // 5 minutes
+const CACHE_DIR = join(homedir(), ".claude");
+const CACHE_FILE = join(CACHE_DIR, ".usage-statusbar-cache.json");
 
 type UsageResponse = {
   five_hour?: {
@@ -51,8 +55,50 @@ function getToken(): string | null {
   return getTokenFromCredentialsFile() ?? getTokenFromKeychain();
 }
 
+type CachedData = {
+  timestamp: number;
+  response: UsageResponse;
+};
+
+function readCache(): UsageResponse | null {
+  try {
+    const stat = statSync(CACHE_FILE);
+    if (Date.now() - stat.mtimeMs > CACHE_TTL_MS) return null;
+    const content = readFileSync(CACHE_FILE, "utf8");
+    const cached: CachedData = JSON.parse(content);
+    if (Date.now() - cached.timestamp > CACHE_TTL_MS) return null;
+    return cached.response;
+  } catch {
+    return null;
+  }
+}
+
+function writeCache(response: UsageResponse): void {
+  try {
+    mkdirSync(CACHE_DIR, { recursive: true });
+    const cached: CachedData = { timestamp: Date.now(), response };
+    writeFileSync(CACHE_FILE, JSON.stringify(cached), "utf8");
+  } catch {
+    // Ignore write errors
+  }
+}
+
+function parseUsageResponse(data: UsageResponse) {
+  const fiveHourPct = data.five_hour?.utilization ?? 0;
+  const sevenDayPct = data.seven_day?.utilization ?? 0;
+
+  let fiveHourResetMs = 0;
+  let fiveHourResetAt: Date | null = null;
+  if (data.five_hour?.resets_at) {
+    fiveHourResetAt = new Date(data.five_hour.resets_at);
+    fiveHourResetMs = Math.max(0, fiveHourResetAt.getTime() - Date.now());
+  }
+
+  return { fiveHourPct, fiveHourResetMs, fiveHourResetAt, sevenDayPct };
+}
+
 /**
- * Fetch usage data from Anthropic API
+ * Fetch usage data from Anthropic API (with 30s file-based cache)
  */
 export async function fetchUsage(): Promise<{
   fiveHourPct: number;
@@ -61,6 +107,10 @@ export async function fetchUsage(): Promise<{
   sevenDayPct: number;
 } | null> {
   try {
+    // Check cache first
+    const cached = readCache();
+    if (cached) return parseUsageResponse(cached);
+
     const token = getToken();
     if (!token) return null;
 
@@ -74,23 +124,9 @@ export async function fetchUsage(): Promise<{
     if (!res.ok) return null;
 
     const data: UsageResponse = await res.json();
+    writeCache(data);
 
-    const fiveHourPct = data.five_hour?.utilization ?? 0;
-    const sevenDayPct = data.seven_day?.utilization ?? 0;
-
-    let fiveHourResetMs = 0;
-    let fiveHourResetAt: Date | null = null;
-    if (data.five_hour?.resets_at) {
-      fiveHourResetAt = new Date(data.five_hour.resets_at);
-      fiveHourResetMs = Math.max(0, fiveHourResetAt.getTime() - Date.now());
-    }
-
-    return {
-      fiveHourPct,
-      fiveHourResetMs,
-      fiveHourResetAt,
-      sevenDayPct,
-    };
+    return parseUsageResponse(data);
   } catch {
     return null;
   }

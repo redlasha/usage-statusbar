@@ -38,10 +38,13 @@ function formatDuration(ms) {
 }
 
 // src/usage-api.ts
-import { readFileSync } from "fs";
+import { readFileSync, writeFileSync, statSync, mkdirSync } from "fs";
 import { execSync } from "child_process";
 import { join } from "path";
 import { homedir } from "os";
+var CACHE_TTL_MS = 300000;
+var CACHE_DIR = join(homedir(), ".claude");
+var CACHE_FILE = join(CACHE_DIR, ".usage-statusbar-cache.json");
 function getTokenFromCredentialsFile() {
   try {
     const credPath = join(homedir(), ".claude", ".credentials.json");
@@ -64,8 +67,43 @@ function getTokenFromKeychain() {
 function getToken() {
   return getTokenFromCredentialsFile() ?? getTokenFromKeychain();
 }
+function readCache() {
+  try {
+    const stat = statSync(CACHE_FILE);
+    if (Date.now() - stat.mtimeMs > CACHE_TTL_MS)
+      return null;
+    const content = readFileSync(CACHE_FILE, "utf8");
+    const cached = JSON.parse(content);
+    if (Date.now() - cached.timestamp > CACHE_TTL_MS)
+      return null;
+    return cached.response;
+  } catch {
+    return null;
+  }
+}
+function writeCache(response) {
+  try {
+    mkdirSync(CACHE_DIR, { recursive: true });
+    const cached = { timestamp: Date.now(), response };
+    writeFileSync(CACHE_FILE, JSON.stringify(cached), "utf8");
+  } catch {}
+}
+function parseUsageResponse(data) {
+  const fiveHourPct = data.five_hour?.utilization ?? 0;
+  const sevenDayPct = data.seven_day?.utilization ?? 0;
+  let fiveHourResetMs = 0;
+  let fiveHourResetAt = null;
+  if (data.five_hour?.resets_at) {
+    fiveHourResetAt = new Date(data.five_hour.resets_at);
+    fiveHourResetMs = Math.max(0, fiveHourResetAt.getTime() - Date.now());
+  }
+  return { fiveHourPct, fiveHourResetMs, fiveHourResetAt, sevenDayPct };
+}
 async function fetchUsage() {
   try {
+    const cached = readCache();
+    if (cached)
+      return parseUsageResponse(cached);
     const token = getToken();
     if (!token)
       return null;
@@ -78,27 +116,15 @@ async function fetchUsage() {
     if (!res.ok)
       return null;
     const data = await res.json();
-    const fiveHourPct = data.five_hour?.utilization ?? 0;
-    const sevenDayPct = data.seven_day?.utilization ?? 0;
-    let fiveHourResetMs = 0;
-    let fiveHourResetAt = null;
-    if (data.five_hour?.resets_at) {
-      fiveHourResetAt = new Date(data.five_hour.resets_at);
-      fiveHourResetMs = Math.max(0, fiveHourResetAt.getTime() - Date.now());
-    }
-    return {
-      fiveHourPct,
-      fiveHourResetMs,
-      fiveHourResetAt,
-      sevenDayPct
-    };
+    writeCache(data);
+    return parseUsageResponse(data);
   } catch {
     return null;
   }
 }
 
 // src/setup.ts
-import { readFileSync as readFileSync2, writeFileSync, mkdirSync, existsSync } from "fs";
+import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, existsSync } from "fs";
 import { join as join2 } from "path";
 import { homedir as homedir2 } from "os";
 var SETTINGS_PATH = join2(homedir2(), ".claude", "settings.json");
@@ -113,9 +139,9 @@ function readSettings() {
 function writeSettings(settings) {
   const dir = join2(homedir2(), ".claude");
   if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true });
+    mkdirSync2(dir, { recursive: true });
   }
-  writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2) + `
+  writeFileSync2(SETTINGS_PATH, JSON.stringify(settings, null, 2) + `
 `);
 }
 function applySettings() {
@@ -135,6 +161,16 @@ function applySettings() {
 async function setup() {
   console.log("✔ usage-statusbar 설치 완료!");
   applySettings();
+}
+async function remove() {
+  const settings = readSettings();
+  if (!settings.statusLine?.command?.includes("usage-statusbar")) {
+    console.log("ℹ️ statusLine 설정이 존재하지 않습니다.");
+    return;
+  }
+  delete settings.statusLine;
+  writeSettings(settings);
+  console.log("✅ statusLine 설정이 제거되었습니다. 다음 Claude Code 세션부터 적용됩니다.");
 }
 
 // src/index.ts
@@ -165,18 +201,20 @@ async function statusline() {
         hour12: false
       });
     }
-    console.log(`\uD83E\uDDE0${contextBar}${Math.round(contextPct)}% ⏰${blockBar}${Math.round(usage.fiveHourPct)}% \uD83D\uDD04${resetKST}(-${resetTime})`);
+    console.log(`\uD83E\uDDE0 ${contextBar}${Math.round(contextPct)}% ⏰ ${blockBar}${Math.round(usage.fiveHourPct)}% \uD83D\uDD04 ${resetKST}(-${resetTime})`);
   } else {
-    console.log(`\uD83E\uDDE0${contextBar}${Math.round(contextPct)}%`);
+    console.log(`\uD83E\uDDE0 ${contextBar}${Math.round(contextPct)}%`);
   }
 }
 async function main() {
   if (process.argv.includes("--setup")) {
     await setup();
+  } else if (process.argv.includes("--remove")) {
+    await remove();
   } else {
     await statusline();
   }
 }
 main().catch(() => {
-  console.log("\uD83E\uDDE0░░░░░--%");
+  console.log("\uD83E\uDDE0 ░░░░░--%");
 });
