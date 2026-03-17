@@ -40,6 +40,7 @@ var import_child_process = require("child_process");
 var import_path = require("path");
 var import_os = require("os");
 var CACHE_TTL_MS = 3e5;
+var MAX_STALE_MS = 36e5;
 var CACHE_DIR = (0, import_path.join)((0, import_os.homedir)(), ".claude");
 var CACHE_FILE = (0, import_path.join)(CACHE_DIR, ".usage-statusbar-cache.json");
 function getTokenFromCredentialsFile() {
@@ -71,17 +72,23 @@ function readCache(staleOk = false) {
   try {
     const content = (0, import_fs.readFileSync)(CACHE_FILE, "utf8");
     const cached = JSON.parse(content);
+    if (!cached.dataTimestamp) cached.dataTimestamp = cached.timestamp;
     if (!staleOk && Date.now() - cached.timestamp > CACHE_TTL_MS) return null;
     return cached;
   } catch {
     return null;
   }
 }
-function writeCache(response, cooldownUntil) {
+function writeCache(response, options) {
   try {
     (0, import_fs.mkdirSync)(CACHE_DIR, { recursive: true });
-    const cached = { timestamp: Date.now(), response };
-    if (cooldownUntil) cached.cooldownUntil = cooldownUntil;
+    const now = Date.now();
+    const cached = {
+      timestamp: now,
+      dataTimestamp: options?.dataTimestamp ?? now,
+      response
+    };
+    if (options?.cooldownUntil) cached.cooldownUntil = options.cooldownUntil;
     (0, import_fs.writeFileSync)(CACHE_FILE, JSON.stringify(cached), "utf8");
   } catch {
   }
@@ -124,15 +131,21 @@ async function fetchUsage() {
     });
     if (!res.ok) {
       const stale = readCache(true);
-      const staleResponse = stale?.response ?? {};
-      if (res.status === 429) {
-        const retryAfter = res.headers.get("retry-after");
-        const cooldownMs = retryAfter ? parseInt(retryAfter, 10) * 1e3 : 6e5;
-        writeCache(staleResponse, Date.now() + cooldownMs);
-      } else {
-        writeCache(staleResponse);
+      const staleResponse = stale?.response;
+      const isStaleUsable = staleResponse && stale && Date.now() - stale.dataTimestamp < MAX_STALE_MS;
+      if (isStaleUsable) {
+        if (res.status === 429) {
+          const retryAfter = res.headers.get("retry-after");
+          const cooldownMs = retryAfter ? parseInt(retryAfter, 10) * 1e3 : 6e5;
+          writeCache(staleResponse, {
+            cooldownUntil: Date.now() + cooldownMs,
+            dataTimestamp: stale.dataTimestamp
+          });
+        } else {
+          writeCache(staleResponse, { dataTimestamp: stale.dataTimestamp });
+        }
       }
-      return staleResponse.five_hour || staleResponse.seven_day ? parseUsageResponse(staleResponse) : null;
+      return staleResponse?.five_hour || staleResponse?.seven_day ? parseUsageResponse(staleResponse) : null;
     }
     const data = await res.json();
     writeCache(data);
@@ -140,7 +153,9 @@ async function fetchUsage() {
   } catch {
     const stale = readCache(true);
     if (stale) {
-      writeCache(stale.response);
+      if (Date.now() - stale.dataTimestamp < MAX_STALE_MS) {
+        writeCache(stale.response, { dataTimestamp: stale.dataTimestamp });
+      }
       return parseUsageResponse(stale.response);
     }
     return null;

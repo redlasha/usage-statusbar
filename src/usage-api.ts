@@ -4,6 +4,7 @@ import { join } from "path";
 import { homedir } from "os";
 
 const CACHE_TTL_MS = 300_000; // 5 minutes
+const MAX_STALE_MS = 3_600_000; // 1 hour — stale data older than this is discarded
 const CACHE_DIR = join(homedir(), ".claude");
 const CACHE_FILE = join(CACHE_DIR, ".usage-statusbar-cache.json");
 
@@ -57,6 +58,7 @@ function getToken(): string | null {
 
 type CachedData = {
   timestamp: number;
+  dataTimestamp: number; // when the data was actually fetched from API
   cooldownUntil?: number;
   response: UsageResponse;
 };
@@ -65,6 +67,8 @@ function readCache(staleOk = false): CachedData | null {
   try {
     const content = readFileSync(CACHE_FILE, "utf8");
     const cached: CachedData = JSON.parse(content);
+    // Backward compat: old cache files without dataTimestamp fall back to timestamp
+    if (!cached.dataTimestamp) cached.dataTimestamp = cached.timestamp;
     if (!staleOk && Date.now() - cached.timestamp > CACHE_TTL_MS) return null;
     return cached;
   } catch {
@@ -72,11 +76,19 @@ function readCache(staleOk = false): CachedData | null {
   }
 }
 
-function writeCache(response: UsageResponse, cooldownUntil?: number): void {
+function writeCache(
+  response: UsageResponse,
+  options?: { cooldownUntil?: number; dataTimestamp?: number }
+): void {
   try {
     mkdirSync(CACHE_DIR, { recursive: true });
-    const cached: CachedData = { timestamp: Date.now(), response };
-    if (cooldownUntil) cached.cooldownUntil = cooldownUntil;
+    const now = Date.now();
+    const cached: CachedData = {
+      timestamp: now,
+      dataTimestamp: options?.dataTimestamp ?? now,
+      response,
+    };
+    if (options?.cooldownUntil) cached.cooldownUntil = options.cooldownUntil;
     writeFileSync(CACHE_FILE, JSON.stringify(cached), "utf8");
   } catch {
     // Ignore write errors
@@ -139,20 +151,31 @@ export async function fetchUsage(): Promise<{
 
     if (!res.ok) {
       const stale = readCache(true);
-      const staleResponse = stale?.response ?? {};
+      const staleResponse = stale?.response;
+      const isStaleUsable =
+        staleResponse &&
+        stale &&
+        Date.now() - stale.dataTimestamp < MAX_STALE_MS;
 
-      if (res.status === 429) {
-        const retryAfter = res.headers.get("retry-after");
-        const cooldownMs = retryAfter
-          ? parseInt(retryAfter, 10) * 1000
-          : 600_000; // default 10 minutes
-        writeCache(staleResponse, Date.now() + cooldownMs);
-      } else {
-        // Other errors: refresh timestamp to avoid immediate retry
-        writeCache(staleResponse);
+      if (isStaleUsable) {
+        if (res.status === 429) {
+          const retryAfter = res.headers.get("retry-after");
+          const cooldownMs = retryAfter
+            ? parseInt(retryAfter, 10) * 1000
+            : 600_000; // default 10 minutes
+          writeCache(staleResponse, {
+            cooldownUntil: Date.now() + cooldownMs,
+            dataTimestamp: stale.dataTimestamp,
+          });
+        } else {
+          // Other errors: refresh timestamp to avoid immediate retry
+          writeCache(staleResponse, { dataTimestamp: stale.dataTimestamp });
+        }
       }
+      // If stale data is too old (>MAX_STALE_MS), don't re-save it.
+      // Next call will retry the API without stale cache interference.
 
-      return staleResponse.five_hour || staleResponse.seven_day
+      return staleResponse?.five_hour || staleResponse?.seven_day
         ? parseUsageResponse(staleResponse)
         : null;
     }
@@ -162,10 +185,12 @@ export async function fetchUsage(): Promise<{
 
     return parseUsageResponse(data);
   } catch {
-    // Network error: refresh timestamp to avoid hammering
+    // Network error: re-save stale data only if it's fresh enough
     const stale = readCache(true);
     if (stale) {
-      writeCache(stale.response);
+      if (Date.now() - stale.dataTimestamp < MAX_STALE_MS) {
+        writeCache(stale.response, { dataTimestamp: stale.dataTimestamp });
+      }
       return parseUsageResponse(stale.response);
     }
     return null;
