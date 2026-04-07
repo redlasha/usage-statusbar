@@ -17,7 +17,7 @@ Most statusline tools focus on cost tracking. If you're on a Claude Pro/Team sub
 ## Install
 
 ```bash
-npm install -g usage-statusbar
+npm install -g @redlasha/usage-statusbar
 ```
 
 The installer will ask to configure your `~/.claude/settings.json` automatically.

@@ -1,4 +1,30 @@
 #!/usr/bin/env node
+var __create = Object.create;
+var __defProp = Object.defineProperty;
+var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
+var __getOwnPropNames = Object.getOwnPropertyNames;
+var __getProtoOf = Object.getPrototypeOf;
+var __hasOwnProp = Object.prototype.hasOwnProperty;
+var __copyProps = (to, from, except, desc) => {
+  if (from && typeof from === "object" || typeof from === "function") {
+    for (let key of __getOwnPropNames(from))
+      if (!__hasOwnProp.call(to, key) && key !== except)
+        __defProp(to, key, { get: () => from[key], enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable });
+  }
+  return to;
+};
+var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__getProtoOf(mod)) : {}, __copyProps(
+  // If the importer is in node compatibility mode or this is not an ESM
+  // file that has been converted to a CommonJS file using a Babel-
+  // compatible transform (i.e. "__esModule" has not been set), then set
+  // "default" to the CommonJS "module.exports" for node compatibility.
+  isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", { value: mod, enumerable: true }) : target,
+  mod
+));
+
+// src/index.ts
+var fs = __toESM(require("fs"), 1);
+var path = __toESM(require("path"), 1);
 
 // src/render.ts
 var BAR_LENGTH = 5;
@@ -212,6 +238,53 @@ async function remove() {
 }
 
 // src/index.ts
+function detectWorktree(cwd) {
+  try {
+    let dir = cwd;
+    for (let i = 0; i < 20; i++) {
+      const dotGit = path.join(dir, ".git");
+      let stat;
+      try {
+        stat = fs.statSync(dotGit);
+      } catch {
+        const parent = path.dirname(dir);
+        if (parent === dir) return { isWorktree: false };
+        dir = parent;
+        continue;
+      }
+      if (stat.isDirectory()) {
+        return { isWorktree: false };
+      }
+      const content = fs.readFileSync(dotGit, "utf8").trim();
+      const m = content.match(/^gitdir:\s*(.+)$/);
+      if (!m) return { isWorktree: true };
+      let gitdir = m[1];
+      if (!path.isAbsolute(gitdir)) {
+        gitdir = path.resolve(dir, gitdir);
+      }
+      try {
+        const head = fs.readFileSync(path.join(gitdir, "HEAD"), "utf8").trim();
+        const refMatch = head.match(/^ref:\s*refs\/heads\/(.+)$/);
+        const branch = refMatch ? refMatch[1] : head.slice(0, 7);
+        return { isWorktree: true, branch };
+      } catch {
+        return { isWorktree: true };
+      }
+    }
+  } catch {
+  }
+  return { isWorktree: false };
+}
+function formatHourKST(date) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Seoul",
+    hour: "numeric",
+    hour12: true
+  }).formatToParts(date);
+  const hour = parts.find((p) => p.type === "hour")?.value ?? "";
+  const dayPeriod = parts.find((p) => p.type === "dayPeriod")?.value ?? "";
+  return `${dayPeriod}${hour}`;
+}
 async function statusline() {
   let input = {};
   try {
@@ -227,24 +300,19 @@ async function statusline() {
   }
   const contextPct = input.context_window?.used_percentage ?? 0;
   const contextBar = renderBar(contextPct);
+  const cwd = input.workspace?.current_dir ?? input.cwd ?? process.cwd();
+  const wt = detectWorktree(cwd);
+  const wtPrefix = wt.isWorktree ? `\u{1F33F} ${wt.branch ?? "wt"} ` : "";
   const usage = await fetchUsage();
   if (usage) {
     const blockBar = renderBar(usage.fiveHourPct);
     const resetTime = formatDuration(usage.fiveHourResetMs);
-    let resetKST = "";
-    if (usage.fiveHourResetAt) {
-      resetKST = usage.fiveHourResetAt.toLocaleTimeString("ko-KR", {
-        timeZone: "Asia/Seoul",
-        hour: "2-digit",
-        minute: "2-digit",
-        hour12: false
-      });
-    }
+    const resetKST = usage.fiveHourResetAt ? formatHourKST(usage.fiveHourResetAt) : "";
     console.log(
-      `\u{1F9E0} ${contextBar}${Math.round(contextPct)}% \u23F0 ${blockBar}${Math.round(usage.fiveHourPct)}% \u{1F504} ${resetKST}(-${resetTime})`
+      `${wtPrefix}\u{1F9E0} ${contextBar}${Math.round(contextPct)}% \u23F0 ${blockBar}${Math.round(usage.fiveHourPct)}% \u{1F504} ${resetKST}(-${resetTime})`
     );
   } else {
-    console.log(`\u{1F9E0} ${contextBar}${Math.round(contextPct)}%`);
+    console.log(`${wtPrefix}\u{1F9E0} ${contextBar}${Math.round(contextPct)}%`);
   }
 }
 async function main() {
