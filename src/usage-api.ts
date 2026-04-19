@@ -6,7 +6,8 @@ import { homedir } from "os";
 const CACHE_TTL_MS = 300_000; // 5 minutes
 const MAX_STALE_MS = 3_600_000; // 1 hour — stale data older than this is discarded
 const CACHE_DIR = join(homedir(), ".claude");
-const CACHE_FILE = join(CACHE_DIR, ".usage-statusbar-cache.json");
+const CACHE_FILE = join(CACHE_DIR, ".claude-usage-cache.json");
+const CACHE_KEY = "claude_usage";
 
 type UsageResponse = {
   five_hour?: {
@@ -18,6 +19,15 @@ type UsageResponse = {
     resets_at: string;
   };
 };
+
+type CacheEntry = {
+  timestamp: number;
+  dataTimestamp: number;
+  cooldownUntil?: number;
+  data: UsageResponse;
+};
+
+type CacheStore = Record<string, CacheEntry>;
 
 /**
  * Get Claude Code OAuth token from credentials file (Linux/Windows)
@@ -56,53 +66,52 @@ function getToken(): string | null {
   return getTokenFromCredentialsFile() ?? getTokenFromKeychain();
 }
 
-type CachedData = {
-  timestamp: number;
-  dataTimestamp: number; // when the data was actually fetched from API
-  cooldownUntil?: number;
-  response: UsageResponse;
-};
-
-function readCache(staleOk = false): CachedData | null {
+function readStore(): CacheStore {
   try {
-    const content = readFileSync(CACHE_FILE, "utf8");
-    const cached: CachedData = JSON.parse(content);
-    // Backward compat: old cache files without dataTimestamp fall back to timestamp
-    if (!cached.dataTimestamp) cached.dataTimestamp = cached.timestamp;
-    if (!staleOk && Date.now() - cached.timestamp > CACHE_TTL_MS) return null;
-    return cached;
+    return JSON.parse(readFileSync(CACHE_FILE, "utf8"));
   } catch {
-    return null;
+    return {};
   }
 }
 
-function writeCache(
-  response: UsageResponse,
-  options?: { cooldownUntil?: number; dataTimestamp?: number }
-): void {
+function writeStore(store: CacheStore): void {
   try {
     mkdirSync(CACHE_DIR, { recursive: true });
-    const now = Date.now();
-    const cached: CachedData = {
-      timestamp: now,
-      dataTimestamp: options?.dataTimestamp ?? now,
-      response,
-    };
-    if (options?.cooldownUntil) cached.cooldownUntil = options.cooldownUntil;
-    writeFileSync(CACHE_FILE, JSON.stringify(cached), "utf8");
+    writeFileSync(CACHE_FILE, JSON.stringify(store), "utf8");
   } catch {
     // Ignore write errors
   }
 }
 
+function readCache(staleOk = false): CacheEntry | null {
+  const store = readStore();
+  const entry = store[CACHE_KEY];
+  if (!entry) return null;
+  // Backward compat: old entries without dataTimestamp fall back to timestamp
+  if (!entry.dataTimestamp) entry.dataTimestamp = entry.timestamp;
+  if (!staleOk && Date.now() - entry.timestamp > CACHE_TTL_MS) return null;
+  return entry;
+}
+
+function writeCache(
+  data: UsageResponse,
+  options?: { cooldownUntil?: number; dataTimestamp?: number }
+): void {
+  const store = readStore();
+  const now = Date.now();
+  store[CACHE_KEY] = {
+    timestamp: now,
+    dataTimestamp: options?.dataTimestamp ?? now,
+    data,
+  };
+  if (options?.cooldownUntil) store[CACHE_KEY].cooldownUntil = options.cooldownUntil;
+  writeStore(store);
+}
+
 function isCoolingDown(): boolean {
-  try {
-    const content = readFileSync(CACHE_FILE, "utf8");
-    const cached: CachedData = JSON.parse(content);
-    return !!cached.cooldownUntil && Date.now() < cached.cooldownUntil;
-  } catch {
-    return false;
-  }
+  const store = readStore();
+  const entry = store[CACHE_KEY];
+  return !!entry?.cooldownUntil && Date.now() < entry.cooldownUntil;
 }
 
 function parseUsageResponse(data: UsageResponse) {
@@ -131,12 +140,12 @@ export async function fetchUsage(): Promise<{
   try {
     // Check cache first (includes cooldown check)
     const cached = readCache();
-    if (cached) return parseUsageResponse(cached.response);
+    if (cached) return parseUsageResponse(cached.data);
 
     // During cooldown, skip API call and use stale cache
     if (isCoolingDown()) {
       const stale = readCache(true);
-      return stale ? parseUsageResponse(stale.response) : null;
+      return stale ? parseUsageResponse(stale.data) : null;
     }
 
     const token = getToken();
@@ -151,32 +160,26 @@ export async function fetchUsage(): Promise<{
 
     if (!res.ok) {
       const stale = readCache(true);
-      const staleResponse = stale?.response;
+      const staleData = stale?.data;
       const isStaleUsable =
-        staleResponse &&
-        stale &&
-        Date.now() - stale.dataTimestamp < MAX_STALE_MS;
+        staleData && stale && Date.now() - stale.dataTimestamp < MAX_STALE_MS;
 
-      if (isStaleUsable) {
-        if (res.status === 429) {
-          const retryAfter = res.headers.get("retry-after");
-          const cooldownMs = retryAfter
-            ? parseInt(retryAfter, 10) * 1000
-            : 600_000; // default 10 minutes
-          writeCache(staleResponse, {
-            cooldownUntil: Date.now() + cooldownMs,
-            dataTimestamp: stale.dataTimestamp,
-          });
-        } else {
-          // Other errors: refresh timestamp to avoid immediate retry
-          writeCache(staleResponse, { dataTimestamp: stale.dataTimestamp });
-        }
+      if (res.status === 429) {
+        const retryAfter = res.headers.get("retry-after");
+        const cooldownMs = retryAfter
+          ? parseInt(retryAfter, 10) * 1000
+          : 600_000; // default 10 minutes
+        writeCache(staleData ?? {}, {
+          cooldownUntil: Date.now() + cooldownMs,
+          dataTimestamp: stale?.dataTimestamp ?? 0,
+        });
+      } else if (isStaleUsable) {
+        // Other errors: refresh timestamp to avoid immediate retry
+        writeCache(staleData!, { dataTimestamp: stale!.dataTimestamp });
       }
-      // If stale data is too old (>MAX_STALE_MS), don't re-save it.
-      // Next call will retry the API without stale cache interference.
 
-      return staleResponse?.five_hour || staleResponse?.seven_day
-        ? parseUsageResponse(staleResponse)
+      return staleData?.five_hour || staleData?.seven_day
+        ? parseUsageResponse(staleData)
         : null;
     }
 
@@ -189,9 +192,9 @@ export async function fetchUsage(): Promise<{
     const stale = readCache(true);
     if (stale) {
       if (Date.now() - stale.dataTimestamp < MAX_STALE_MS) {
-        writeCache(stale.response, { dataTimestamp: stale.dataTimestamp });
+        writeCache(stale.data, { dataTimestamp: stale.dataTimestamp });
       }
-      return parseUsageResponse(stale.response);
+      return parseUsageResponse(stale.data);
     }
     return null;
   }

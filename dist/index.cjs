@@ -68,7 +68,8 @@ var import_os = require("os");
 var CACHE_TTL_MS = 3e5;
 var MAX_STALE_MS = 36e5;
 var CACHE_DIR = (0, import_path.join)((0, import_os.homedir)(), ".claude");
-var CACHE_FILE = (0, import_path.join)(CACHE_DIR, ".usage-statusbar-cache.json");
+var CACHE_FILE = (0, import_path.join)(CACHE_DIR, ".claude-usage-cache.json");
+var CACHE_KEY = "claude_usage";
 function getTokenFromCredentialsFile() {
   try {
     const credPath = (0, import_path.join)((0, import_os.homedir)(), ".claude", ".credentials.json");
@@ -94,39 +95,43 @@ function getTokenFromKeychain() {
 function getToken() {
   return getTokenFromCredentialsFile() ?? getTokenFromKeychain();
 }
-function readCache(staleOk = false) {
+function readStore() {
   try {
-    const content = (0, import_fs.readFileSync)(CACHE_FILE, "utf8");
-    const cached = JSON.parse(content);
-    if (!cached.dataTimestamp) cached.dataTimestamp = cached.timestamp;
-    if (!staleOk && Date.now() - cached.timestamp > CACHE_TTL_MS) return null;
-    return cached;
+    return JSON.parse((0, import_fs.readFileSync)(CACHE_FILE, "utf8"));
   } catch {
-    return null;
+    return {};
   }
 }
-function writeCache(response, options) {
+function writeStore(store) {
   try {
     (0, import_fs.mkdirSync)(CACHE_DIR, { recursive: true });
-    const now = Date.now();
-    const cached = {
-      timestamp: now,
-      dataTimestamp: options?.dataTimestamp ?? now,
-      response
-    };
-    if (options?.cooldownUntil) cached.cooldownUntil = options.cooldownUntil;
-    (0, import_fs.writeFileSync)(CACHE_FILE, JSON.stringify(cached), "utf8");
+    (0, import_fs.writeFileSync)(CACHE_FILE, JSON.stringify(store), "utf8");
   } catch {
   }
 }
+function readCache(staleOk = false) {
+  const store = readStore();
+  const entry = store[CACHE_KEY];
+  if (!entry) return null;
+  if (!entry.dataTimestamp) entry.dataTimestamp = entry.timestamp;
+  if (!staleOk && Date.now() - entry.timestamp > CACHE_TTL_MS) return null;
+  return entry;
+}
+function writeCache(data, options) {
+  const store = readStore();
+  const now = Date.now();
+  store[CACHE_KEY] = {
+    timestamp: now,
+    dataTimestamp: options?.dataTimestamp ?? now,
+    data
+  };
+  if (options?.cooldownUntil) store[CACHE_KEY].cooldownUntil = options.cooldownUntil;
+  writeStore(store);
+}
 function isCoolingDown() {
-  try {
-    const content = (0, import_fs.readFileSync)(CACHE_FILE, "utf8");
-    const cached = JSON.parse(content);
-    return !!cached.cooldownUntil && Date.now() < cached.cooldownUntil;
-  } catch {
-    return false;
-  }
+  const store = readStore();
+  const entry = store[CACHE_KEY];
+  return !!entry?.cooldownUntil && Date.now() < entry.cooldownUntil;
 }
 function parseUsageResponse(data) {
   const fiveHourPct = data.five_hour?.utilization ?? 0;
@@ -142,10 +147,10 @@ function parseUsageResponse(data) {
 async function fetchUsage() {
   try {
     const cached = readCache();
-    if (cached) return parseUsageResponse(cached.response);
+    if (cached) return parseUsageResponse(cached.data);
     if (isCoolingDown()) {
       const stale = readCache(true);
-      return stale ? parseUsageResponse(stale.response) : null;
+      return stale ? parseUsageResponse(stale.data) : null;
     }
     const token = getToken();
     if (!token) return null;
@@ -157,21 +162,19 @@ async function fetchUsage() {
     });
     if (!res.ok) {
       const stale = readCache(true);
-      const staleResponse = stale?.response;
-      const isStaleUsable = staleResponse && stale && Date.now() - stale.dataTimestamp < MAX_STALE_MS;
-      if (isStaleUsable) {
-        if (res.status === 429) {
-          const retryAfter = res.headers.get("retry-after");
-          const cooldownMs = retryAfter ? parseInt(retryAfter, 10) * 1e3 : 6e5;
-          writeCache(staleResponse, {
-            cooldownUntil: Date.now() + cooldownMs,
-            dataTimestamp: stale.dataTimestamp
-          });
-        } else {
-          writeCache(staleResponse, { dataTimestamp: stale.dataTimestamp });
-        }
+      const staleData = stale?.data;
+      const isStaleUsable = staleData && stale && Date.now() - stale.dataTimestamp < MAX_STALE_MS;
+      if (res.status === 429) {
+        const retryAfter = res.headers.get("retry-after");
+        const cooldownMs = retryAfter ? parseInt(retryAfter, 10) * 1e3 : 6e5;
+        writeCache(staleData ?? {}, {
+          cooldownUntil: Date.now() + cooldownMs,
+          dataTimestamp: stale?.dataTimestamp ?? 0
+        });
+      } else if (isStaleUsable) {
+        writeCache(staleData, { dataTimestamp: stale.dataTimestamp });
       }
-      return staleResponse?.five_hour || staleResponse?.seven_day ? parseUsageResponse(staleResponse) : null;
+      return staleData?.five_hour || staleData?.seven_day ? parseUsageResponse(staleData) : null;
     }
     const data = await res.json();
     writeCache(data);
@@ -180,9 +183,9 @@ async function fetchUsage() {
     const stale = readCache(true);
     if (stale) {
       if (Date.now() - stale.dataTimestamp < MAX_STALE_MS) {
-        writeCache(stale.response, { dataTimestamp: stale.dataTimestamp });
+        writeCache(stale.data, { dataTimestamp: stale.dataTimestamp });
       }
-      return parseUsageResponse(stale.response);
+      return parseUsageResponse(stale.data);
     }
     return null;
   }
