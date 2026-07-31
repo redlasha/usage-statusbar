@@ -52,15 +52,26 @@ export function renderAccount(account: Account | null): string {
   return `${color}👤${slot}${account.label}${ANSI.reset} `;
 }
 
+/**
+ * 모델명(display_name)을 비용 등급에 따라 색상을 입혀 반환.
+ * - Opus: red   (가장 비쌈)
+ * - Sonnet: yellow
+ * - Fable/Haiku: green (가장 저렴)
+ * - 그 외: dim
+ */
+export function renderModel(displayName: string): string {
+  const name = displayName.toLowerCase();
+  let color = ANSI.dim;
+  if (name.includes("opus")) color = ANSI.red;
+  else if (name.includes("sonnet")) color = ANSI.yellow;
+  else if (name.includes("fable") || name.includes("haiku")) color = ANSI.green;
+
+  return `${color}${displayName}${ANSI.reset}`;
+}
+
 export function formatDuration(ms: number): string {
-  if (ms <= 0) return "0m";
+  if (ms <= 0) return "0";
 
-  const totalMinutes = Math.floor(ms / 60000);
-  const hours = Math.floor(totalMinutes / 60);
-  const minutes = totalMinutes % 60;
-
-  if (hours > 0) {
-    return `${hours}h ${minutes}m`;
-  }
-  return `${minutes}m`;
+  const hours = ms / 3600000;
+  return hours.toFixed(1);
 }

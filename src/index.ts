@@ -2,7 +2,7 @@
 
 import * as fs from "fs";
 import * as path from "path";
-import { renderBar, renderAccount, formatDuration } from "./render";
+import { renderBar, renderAccount, renderModel, formatDuration } from "./render";
 import { fetchUsage } from "./usage-api";
 import { setup, remove } from "./setup";
 
@@ -13,6 +13,10 @@ type StatusLineInput = {
   cwd?: string;
   workspace?: {
     current_dir?: string;
+  };
+  model?: {
+    id?: string;
+    display_name?: string;
   };
 };
 
@@ -68,17 +72,19 @@ function detectWorktree(cwd: string): { isWorktree: boolean; branch?: string } {
 }
 
 /**
- * 시간을 "PM3", "AM11" 형식으로 포맷 (KST).
+ * 시간을 "PM3:05", "AM11:33" 형식으로 포맷 (KST).
  */
 function formatHourKST(date: Date): string {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: "Asia/Seoul",
     hour: "numeric",
+    minute: "2-digit",
     hour12: true,
   }).formatToParts(date);
   const hour = parts.find((p) => p.type === "hour")?.value ?? "";
+  const minute = parts.find((p) => p.type === "minute")?.value ?? "";
   const dayPeriod = parts.find((p) => p.type === "dayPeriod")?.value ?? "";
-  return `${dayPeriod}${hour}`;
+  return `${dayPeriod}${hour}:${minute}`;
 }
 
 async function statusline() {
@@ -108,6 +114,10 @@ async function statusline() {
     ? `🌿 ${wt.branch ?? "wt"} `
     : "";
 
+  // 모델명 (비용 등급별 색상)
+  const modelName = input.model?.display_name;
+  const modelPrefix = modelName ? `${renderModel(modelName)} ` : "";
+
   // 5-hour block usage from API
   const usage = await fetchUsage();
 
@@ -121,10 +131,10 @@ async function statusline() {
       : "";
 
     console.log(
-      `${wtPrefix}${acct}🧠 ${contextBar}${Math.round(contextPct)}% ⏰ ${blockBar}${Math.round(usage.fiveHourPct)}% 🔄 ${resetKST}(-${resetTime})`
+      `${wtPrefix}${acct}${modelPrefix}🧠 ${contextBar}${Math.round(contextPct)}% ⏰ ${blockBar}${Math.round(usage.fiveHourPct)}% 🔄 ${resetKST}(-${resetTime})`
     );
   } else {
-    console.log(`${wtPrefix}🧠 ${contextBar}${Math.round(contextPct)}%`);
+    console.log(`${wtPrefix}${modelPrefix}🧠 ${contextBar}${Math.round(contextPct)}%`);
   }
 }
 

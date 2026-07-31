@@ -57,15 +57,18 @@ function renderAccount(account) {
   const slot = account.slot !== null ? `${account.slot}\xB7` : "";
   return `${color}\u{1F464}${slot}${account.label}${ANSI.reset} `;
 }
+function renderModel(displayName) {
+  const name = displayName.toLowerCase();
+  let color = ANSI.dim;
+  if (name.includes("opus")) color = ANSI.red;
+  else if (name.includes("sonnet")) color = ANSI.yellow;
+  else if (name.includes("fable") || name.includes("haiku")) color = ANSI.green;
+  return `${color}${displayName}${ANSI.reset}`;
+}
 function formatDuration(ms) {
-  if (ms <= 0) return "0m";
-  const totalMinutes = Math.floor(ms / 6e4);
-  const hours = Math.floor(totalMinutes / 60);
-  const minutes = totalMinutes % 60;
-  if (hours > 0) {
-    return `${hours}h ${minutes}m`;
-  }
-  return `${minutes}m`;
+  if (ms <= 0) return "0";
+  const hours = ms / 36e5;
+  return hours.toFixed(1);
 }
 
 // src/usage-api.ts
@@ -384,11 +387,13 @@ function formatHourKST(date) {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: "Asia/Seoul",
     hour: "numeric",
+    minute: "2-digit",
     hour12: true
   }).formatToParts(date);
   const hour = parts.find((p) => p.type === "hour")?.value ?? "";
+  const minute = parts.find((p) => p.type === "minute")?.value ?? "";
   const dayPeriod = parts.find((p) => p.type === "dayPeriod")?.value ?? "";
-  return `${dayPeriod}${hour}`;
+  return `${dayPeriod}${hour}:${minute}`;
 }
 async function statusline() {
   let input = {};
@@ -408,6 +413,8 @@ async function statusline() {
   const cwd = input.workspace?.current_dir ?? input.cwd ?? process.cwd();
   const wt = detectWorktree(cwd);
   const wtPrefix = wt.isWorktree ? `\u{1F33F} ${wt.branch ?? "wt"} ` : "";
+  const modelName = input.model?.display_name;
+  const modelPrefix = modelName ? `${renderModel(modelName)} ` : "";
   const usage = await fetchUsage();
   if (usage) {
     const acct = renderAccount(usage.account);
@@ -415,10 +422,10 @@ async function statusline() {
     const resetTime = formatDuration(usage.fiveHourResetMs);
     const resetKST = usage.fiveHourResetAt ? formatHourKST(usage.fiveHourResetAt) : "";
     console.log(
-      `${wtPrefix}${acct}\u{1F9E0} ${contextBar}${Math.round(contextPct)}% \u23F0 ${blockBar}${Math.round(usage.fiveHourPct)}% \u{1F504} ${resetKST}(-${resetTime})`
+      `${wtPrefix}${acct}${modelPrefix}\u{1F9E0} ${contextBar}${Math.round(contextPct)}% \u23F0 ${blockBar}${Math.round(usage.fiveHourPct)}% \u{1F504} ${resetKST}(-${resetTime})`
     );
   } else {
-    console.log(`${wtPrefix}\u{1F9E0} ${contextBar}${Math.round(contextPct)}%`);
+    console.log(`${wtPrefix}${modelPrefix}\u{1F9E0} ${contextBar}${Math.round(contextPct)}%`);
   }
 }
 async function main() {
