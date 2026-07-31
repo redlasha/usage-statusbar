@@ -2,7 +2,7 @@
 
 import * as fs from "fs";
 import * as path from "path";
-import { renderBar, formatDuration } from "./render";
+import { renderBar, renderAccount, formatDuration } from "./render";
 import { fetchUsage } from "./usage-api";
 import { setup, remove } from "./setup";
 
@@ -112,6 +112,7 @@ async function statusline() {
   const usage = await fetchUsage();
 
   if (usage) {
+    const acct = renderAccount(usage.account);
     const blockBar = renderBar(usage.fiveHourPct);
     const resetTime = formatDuration(usage.fiveHourResetMs);
 
@@ -120,7 +121,7 @@ async function statusline() {
       : "";
 
     console.log(
-      `${wtPrefix}🧠 ${contextBar}${Math.round(contextPct)}% ⏰ ${blockBar}${Math.round(usage.fiveHourPct)}% 🔄 ${resetKST}(-${resetTime})`
+      `${wtPrefix}${acct}🧠 ${contextBar}${Math.round(contextPct)}% ⏰ ${blockBar}${Math.round(usage.fiveHourPct)}% 🔄 ${resetKST}(-${resetTime})`
     );
   } else {
     console.log(`${wtPrefix}🧠 ${contextBar}${Math.round(contextPct)}%`);

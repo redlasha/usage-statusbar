@@ -1,13 +1,25 @@
-import { readFileSync, writeFileSync, mkdirSync } from "fs";
-import { execSync } from "child_process";
+import { readFileSync, writeFileSync, mkdirSync, statSync } from "fs";
+import { execFileSync } from "child_process";
 import { join } from "path";
 import { homedir } from "os";
+import { getAccount, type Account } from "./account";
 
 const CACHE_TTL_MS = 300_000; // 5 minutes
 const MAX_STALE_MS = 3_600_000; // 1 hour — stale data older than this is discarded
-const CACHE_DIR = join(homedir(), ".claude");
-const CACHE_FILE = join(CACHE_DIR, ".claude-usage-cache.json");
-const CACHE_KEY = "claude_usage";
+/** cswap run 같은 세션 모드에서는 프로필 디렉터리가 다르므로 env를 존중해야 한다 */
+const CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude");
+const CACHE_FILE = join(CONFIG_DIR, ".claude-usage-cache.json");
+const CREDENTIALS_FILE = join(CONFIG_DIR, ".credentials.json");
+const CLAUDE_JSON = join(process.env.CLAUDE_CONFIG_DIR ?? homedir(), ".claude.json");
+
+/**
+ * 계정을 모르던 시절의 키. ai-usage-monitor가 이 키를 읽으므로
+ * 활성 계정 데이터를 여기에도 미러링해 하위 호환을 유지한다.
+ */
+const LEGACY_CACHE_KEY = "claude_usage";
+
+/** Keychain 조회가 걸리면 statusline 전체가 멈추므로 상한을 둔다 */
+const KEYCHAIN_TIMEOUT_MS = 2000;
 
 type UsageResponse = {
   five_hour?: {
@@ -30,13 +42,19 @@ type CacheEntry = {
 type CacheStore = Record<string, CacheEntry>;
 
 /**
+ * 계정별 캐시 키. 단일 키를 쓰면 계정 전환 후에도 이전 계정 수치가
+ * TTL 동안 그대로 표시된다.
+ */
+function cacheKey(account: Account | null): string {
+  return account ? `${LEGACY_CACHE_KEY}:${account.orgUuid}` : LEGACY_CACHE_KEY;
+}
+
+/**
  * Get Claude Code OAuth token from credentials file (Linux/Windows)
  */
 function getTokenFromCredentialsFile(): string | null {
   try {
-    const credPath = join(homedir(), ".claude", ".credentials.json");
-    const content = readFileSync(credPath, "utf8");
-    const creds = JSON.parse(content);
+    const creds = JSON.parse(readFileSync(CREDENTIALS_FILE, "utf8"));
     return creds?.claudeAiOauth?.accessToken ?? null;
   } catch {
     return null;
@@ -44,25 +62,83 @@ function getTokenFromCredentialsFile(): string | null {
 }
 
 /**
- * Get Claude Code OAuth token from macOS Keychain
+ * Get Claude Code OAuth token from macOS Keychain.
+ * 읽은 값은 파일로도 복사해 다음 조회부터는 Keychain을 건드리지 않게 한다.
  */
 function getTokenFromKeychain(): string | null {
   try {
-    const result = execSync(
-      'security find-generic-password -s "Claude Code-credentials" -w',
-      { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }
+    // 셸을 거치지 않도록 execFile 사용 (인자 배열 전달)
+    const result = execFileSync(
+      "security",
+      ["find-generic-password", "-s", "Claude Code-credentials", "-w"],
+      {
+        encoding: "utf8",
+        stdio: ["pipe", "pipe", "pipe"],
+        timeout: KEYCHAIN_TIMEOUT_MS,
+      }
     ).trim();
     const creds = JSON.parse(result);
-    return creds?.claudeAiOauth?.accessToken ?? null;
+    const token = creds?.claudeAiOauth?.accessToken ?? null;
+
+    if (token) {
+      try {
+        mkdirSync(CONFIG_DIR, { recursive: true });
+        writeFileSync(CREDENTIALS_FILE, JSON.stringify(creds, null, 2), {
+          encoding: "utf8",
+          mode: 0o600,
+        });
+      } catch {
+        // best-effort
+      }
+    }
+
+    return token;
+  } catch {
+    return null;
+  }
+}
+
+function mtimeMs(path: string): number | null {
+  try {
+    return statSync(path).mtimeMs;
   } catch {
     return null;
   }
 }
 
 /**
- * Get Claude Code OAuth token (credentials file → macOS Keychain fallback)
+ * .credentials.json이 현재 계정 것인지 판정한다.
+ *
+ * macOS에서 Claude Code의 자격증명 정본은 Keychain이고, 전환 도구는 보통
+ * Keychain만 갱신한다. 다만 .claude.json은 함께 갱신되므로, 그쪽이 더 새것이면
+ * 자격증명 파일은 이전 계정 것으로 봐야 한다.
  */
-function getToken(): string | null {
+function credentialsFileLooksStale(): boolean {
+  const cred = mtimeMs(CREDENTIALS_FILE);
+  if (cred === null) return true;
+
+  const config = mtimeMs(CLAUDE_JSON);
+  if (config === null) return false;
+
+  return config > cred;
+}
+
+/**
+ * Get Claude Code OAuth token.
+ *
+ * Keychain이 정본이지만 조회할 때마다 접근 승인 다이얼로그가 뜰 수 있어서,
+ * 전환이 의심될 때만 조회한다. Keychain을 읽으면 파일도 갱신되므로
+ * 실질적으로 "전환당 1회"로 수렴한다.
+ */
+function getToken(forceKeychain = false): string | null {
+  if (process.platform !== "darwin") {
+    return getTokenFromCredentialsFile() ?? getTokenFromKeychain();
+  }
+
+  if (forceKeychain || credentialsFileLooksStale()) {
+    return getTokenFromKeychain() ?? getTokenFromCredentialsFile();
+  }
+
   return getTokenFromCredentialsFile() ?? getTokenFromKeychain();
 }
 
@@ -76,16 +152,16 @@ function readStore(): CacheStore {
 
 function writeStore(store: CacheStore): void {
   try {
-    mkdirSync(CACHE_DIR, { recursive: true });
+    mkdirSync(CONFIG_DIR, { recursive: true });
     writeFileSync(CACHE_FILE, JSON.stringify(store), "utf8");
   } catch {
     // Ignore write errors
   }
 }
 
-function readCache(staleOk = false): CacheEntry | null {
+function readCache(key: string, staleOk = false): CacheEntry | null {
   const store = readStore();
-  const entry = store[CACHE_KEY];
+  const entry = store[key];
   if (!entry) return null;
   // Backward compat: old entries without dataTimestamp fall back to timestamp
   if (!entry.dataTimestamp) entry.dataTimestamp = entry.timestamp;
@@ -94,23 +170,29 @@ function readCache(staleOk = false): CacheEntry | null {
 }
 
 function writeCache(
+  key: string,
   data: UsageResponse,
   options?: { cooldownUntil?: number; dataTimestamp?: number }
 ): void {
   const store = readStore();
   const now = Date.now();
-  store[CACHE_KEY] = {
+  const entry: CacheEntry = {
     timestamp: now,
     dataTimestamp: options?.dataTimestamp ?? now,
     data,
   };
-  if (options?.cooldownUntil) store[CACHE_KEY].cooldownUntil = options.cooldownUntil;
+  if (options?.cooldownUntil) entry.cooldownUntil = options.cooldownUntil;
+
+  store[key] = entry;
+  // 활성 계정 데이터를 레거시 키에도 미러링 (ai-usage-monitor 호환)
+  if (key !== LEGACY_CACHE_KEY) store[LEGACY_CACHE_KEY] = entry;
+
   writeStore(store);
 }
 
-function isCoolingDown(): boolean {
+function isCoolingDown(key: string): boolean {
   const store = readStore();
-  const entry = store[CACHE_KEY];
+  const entry = store[key];
   return !!entry?.cooldownUntil && Date.now() < entry.cooldownUntil;
 }
 
@@ -128,38 +210,56 @@ function parseUsageResponse(data: UsageResponse) {
   return { fiveHourPct, fiveHourResetMs, fiveHourResetAt, sevenDayPct };
 }
 
+function requestUsage(token: string): Promise<Response> {
+  return fetch("https://api.anthropic.com/api/oauth/usage", {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "anthropic-beta": "oauth-2025-04-20",
+    },
+  });
+}
+
 /**
- * Fetch usage data from Anthropic API (with file-based cache)
+ * Fetch usage data from Anthropic API (with per-account file cache)
  */
 export async function fetchUsage(): Promise<{
   fiveHourPct: number;
   fiveHourResetMs: number;
   fiveHourResetAt: Date | null;
   sevenDayPct: number;
+  account: Account | null;
 } | null> {
+  const account = getAccount();
+  const key = cacheKey(account);
+  const withAccount = <T extends object>(v: T) => ({ ...v, account });
+
   try {
     // Check cache first (includes cooldown check)
-    const cached = readCache();
-    if (cached) return parseUsageResponse(cached.data);
+    const cached = readCache(key);
+    if (cached) return withAccount(parseUsageResponse(cached.data));
 
     // During cooldown, skip API call and use stale cache
-    if (isCoolingDown()) {
-      const stale = readCache(true);
-      return stale ? parseUsageResponse(stale.data) : null;
+    if (isCoolingDown(key)) {
+      const stale = readCache(key, true);
+      return stale ? withAccount(parseUsageResponse(stale.data)) : null;
     }
 
-    const token = getToken();
+    let token = getToken();
     if (!token) return null;
 
-    const res = await fetch("https://api.anthropic.com/api/oauth/usage", {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "anthropic-beta": "oauth-2025-04-20",
-      },
-    });
+    let res = await requestUsage(token);
+
+    // 파일의 토큰이 만료됐을 수 있다 — Keychain으로 한 번만 재시도
+    if (res.status === 401) {
+      const fresh = getToken(true);
+      if (fresh && fresh !== token) {
+        token = fresh;
+        res = await requestUsage(token);
+      }
+    }
 
     if (!res.ok) {
-      const stale = readCache(true);
+      const stale = readCache(key, true);
       const staleData = stale?.data;
       const isStaleUsable =
         staleData && stale && Date.now() - stale.dataTimestamp < MAX_STALE_MS;
@@ -169,32 +269,32 @@ export async function fetchUsage(): Promise<{
         const cooldownMs = retryAfter
           ? parseInt(retryAfter, 10) * 1000
           : 600_000; // default 10 minutes
-        writeCache(staleData ?? {}, {
+        writeCache(key, staleData ?? {}, {
           cooldownUntil: Date.now() + cooldownMs,
           dataTimestamp: stale?.dataTimestamp ?? 0,
         });
       } else if (isStaleUsable) {
         // Other errors: refresh timestamp to avoid immediate retry
-        writeCache(staleData!, { dataTimestamp: stale!.dataTimestamp });
+        writeCache(key, staleData!, { dataTimestamp: stale!.dataTimestamp });
       }
 
       return staleData?.five_hour || staleData?.seven_day
-        ? parseUsageResponse(staleData)
+        ? withAccount(parseUsageResponse(staleData))
         : null;
     }
 
     const data: UsageResponse = await res.json();
-    writeCache(data);
+    writeCache(key, data);
 
-    return parseUsageResponse(data);
+    return withAccount(parseUsageResponse(data));
   } catch {
     // Network error: re-save stale data only if it's fresh enough
-    const stale = readCache(true);
+    const stale = readCache(key, true);
     if (stale) {
       if (Date.now() - stale.dataTimestamp < MAX_STALE_MS) {
-        writeCache(stale.data, { dataTimestamp: stale.dataTimestamp });
+        writeCache(key, stale.data, { dataTimestamp: stale.dataTimestamp });
       }
-      return parseUsageResponse(stale.data);
+      return withAccount(parseUsageResponse(stale.data));
     }
     return null;
   }

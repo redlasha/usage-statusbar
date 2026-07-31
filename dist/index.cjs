@@ -32,6 +32,8 @@ var ANSI = {
   green: "\x1B[32m",
   yellow: "\x1B[33m",
   red: "\x1B[31m",
+  cyan: "\x1B[36m",
+  magenta: "\x1B[35m",
   dim: "\x1B[90m",
   reset: "\x1B[0m"
 };
@@ -49,6 +51,12 @@ function renderBar(percentage) {
   const empty = `${ANSI.dim}${"\u2591".repeat(emptyCount)}${ANSI.reset}`;
   return filled + empty;
 }
+function renderAccount(account) {
+  if (!account) return "";
+  const color = account.slot === 1 ? ANSI.cyan : account.slot === 2 ? ANSI.magenta : ANSI.dim;
+  const slot = account.slot !== null ? `${account.slot}\xB7` : "";
+  return `${color}\u{1F464}${slot}${account.label}${ANSI.reset} `;
+}
 function formatDuration(ms) {
   if (ms <= 0) return "0m";
   const totalMinutes = Math.floor(ms / 6e4);
@@ -61,20 +69,63 @@ function formatDuration(ms) {
 }
 
 // src/usage-api.ts
-var import_fs = require("fs");
+var import_fs2 = require("fs");
 var import_child_process = require("child_process");
+var import_path2 = require("path");
+var import_os2 = require("os");
+
+// src/account.ts
+var import_fs = require("fs");
 var import_path = require("path");
 var import_os = require("os");
+var CLAUDE_JSON = (0, import_path.join)(process.env.CLAUDE_CONFIG_DIR ?? (0, import_os.homedir)(), ".claude.json");
+var SWAP_SEQUENCE = (0, import_path.join)((0, import_os.homedir)(), ".claude-swap-backup", "sequence.json");
+function shortLabel(orgName) {
+  if (/'s Organization$/.test(orgName)) return "personal";
+  return orgName.length > 12 ? `${orgName.slice(0, 12)}\u2026` : orgName;
+}
+function findSlot(orgUuid) {
+  try {
+    const seq = JSON.parse((0, import_fs.readFileSync)(SWAP_SEQUENCE, "utf8"));
+    for (const [num, acct] of Object.entries(seq?.accounts ?? {})) {
+      if (acct?.organizationUuid === orgUuid) return Number(num);
+    }
+  } catch {
+  }
+  return null;
+}
+function getAccount() {
+  try {
+    const config = JSON.parse((0, import_fs.readFileSync)(CLAUDE_JSON, "utf8"));
+    const orgUuid = config?.oauthAccount?.organizationUuid;
+    if (!orgUuid) return null;
+    const orgName = config?.oauthAccount?.organizationName ?? "unknown";
+    return {
+      orgUuid,
+      orgName,
+      slot: findSlot(orgUuid),
+      label: shortLabel(orgName)
+    };
+  } catch {
+    return null;
+  }
+}
+
+// src/usage-api.ts
 var CACHE_TTL_MS = 3e5;
 var MAX_STALE_MS = 36e5;
-var CACHE_DIR = (0, import_path.join)((0, import_os.homedir)(), ".claude");
-var CACHE_FILE = (0, import_path.join)(CACHE_DIR, ".claude-usage-cache.json");
-var CACHE_KEY = "claude_usage";
+var CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR ?? (0, import_path2.join)((0, import_os2.homedir)(), ".claude");
+var CACHE_FILE = (0, import_path2.join)(CONFIG_DIR, ".claude-usage-cache.json");
+var CREDENTIALS_FILE = (0, import_path2.join)(CONFIG_DIR, ".credentials.json");
+var CLAUDE_JSON2 = (0, import_path2.join)(process.env.CLAUDE_CONFIG_DIR ?? (0, import_os2.homedir)(), ".claude.json");
+var LEGACY_CACHE_KEY = "claude_usage";
+var KEYCHAIN_TIMEOUT_MS = 2e3;
+function cacheKey(account) {
+  return account ? `${LEGACY_CACHE_KEY}:${account.orgUuid}` : LEGACY_CACHE_KEY;
+}
 function getTokenFromCredentialsFile() {
   try {
-    const credPath = (0, import_path.join)((0, import_os.homedir)(), ".claude", ".credentials.json");
-    const content = (0, import_fs.readFileSync)(credPath, "utf8");
-    const creds = JSON.parse(content);
+    const creds = JSON.parse((0, import_fs2.readFileSync)(CREDENTIALS_FILE, "utf8"));
     return creds?.claudeAiOauth?.accessToken ?? null;
   } catch {
     return null;
@@ -82,55 +133,93 @@ function getTokenFromCredentialsFile() {
 }
 function getTokenFromKeychain() {
   try {
-    const result = (0, import_child_process.execSync)(
-      'security find-generic-password -s "Claude Code-credentials" -w',
-      { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }
+    const result = (0, import_child_process.execFileSync)(
+      "security",
+      ["find-generic-password", "-s", "Claude Code-credentials", "-w"],
+      {
+        encoding: "utf8",
+        stdio: ["pipe", "pipe", "pipe"],
+        timeout: KEYCHAIN_TIMEOUT_MS
+      }
     ).trim();
     const creds = JSON.parse(result);
-    return creds?.claudeAiOauth?.accessToken ?? null;
+    const token = creds?.claudeAiOauth?.accessToken ?? null;
+    if (token) {
+      try {
+        (0, import_fs2.mkdirSync)(CONFIG_DIR, { recursive: true });
+        (0, import_fs2.writeFileSync)(CREDENTIALS_FILE, JSON.stringify(creds, null, 2), {
+          encoding: "utf8",
+          mode: 384
+        });
+      } catch {
+      }
+    }
+    return token;
   } catch {
     return null;
   }
 }
-function getToken() {
+function mtimeMs(path2) {
+  try {
+    return (0, import_fs2.statSync)(path2).mtimeMs;
+  } catch {
+    return null;
+  }
+}
+function credentialsFileLooksStale() {
+  const cred = mtimeMs(CREDENTIALS_FILE);
+  if (cred === null) return true;
+  const config = mtimeMs(CLAUDE_JSON2);
+  if (config === null) return false;
+  return config > cred;
+}
+function getToken(forceKeychain = false) {
+  if (process.platform !== "darwin") {
+    return getTokenFromCredentialsFile() ?? getTokenFromKeychain();
+  }
+  if (forceKeychain || credentialsFileLooksStale()) {
+    return getTokenFromKeychain() ?? getTokenFromCredentialsFile();
+  }
   return getTokenFromCredentialsFile() ?? getTokenFromKeychain();
 }
 function readStore() {
   try {
-    return JSON.parse((0, import_fs.readFileSync)(CACHE_FILE, "utf8"));
+    return JSON.parse((0, import_fs2.readFileSync)(CACHE_FILE, "utf8"));
   } catch {
     return {};
   }
 }
 function writeStore(store) {
   try {
-    (0, import_fs.mkdirSync)(CACHE_DIR, { recursive: true });
-    (0, import_fs.writeFileSync)(CACHE_FILE, JSON.stringify(store), "utf8");
+    (0, import_fs2.mkdirSync)(CONFIG_DIR, { recursive: true });
+    (0, import_fs2.writeFileSync)(CACHE_FILE, JSON.stringify(store), "utf8");
   } catch {
   }
 }
-function readCache(staleOk = false) {
+function readCache(key, staleOk = false) {
   const store = readStore();
-  const entry = store[CACHE_KEY];
+  const entry = store[key];
   if (!entry) return null;
   if (!entry.dataTimestamp) entry.dataTimestamp = entry.timestamp;
   if (!staleOk && Date.now() - entry.timestamp > CACHE_TTL_MS) return null;
   return entry;
 }
-function writeCache(data, options) {
+function writeCache(key, data, options) {
   const store = readStore();
   const now = Date.now();
-  store[CACHE_KEY] = {
+  const entry = {
     timestamp: now,
     dataTimestamp: options?.dataTimestamp ?? now,
     data
   };
-  if (options?.cooldownUntil) store[CACHE_KEY].cooldownUntil = options.cooldownUntil;
+  if (options?.cooldownUntil) entry.cooldownUntil = options.cooldownUntil;
+  store[key] = entry;
+  if (key !== LEGACY_CACHE_KEY) store[LEGACY_CACHE_KEY] = entry;
   writeStore(store);
 }
-function isCoolingDown() {
+function isCoolingDown(key) {
   const store = readStore();
-  const entry = store[CACHE_KEY];
+  const entry = store[key];
   return !!entry?.cooldownUntil && Date.now() < entry.cooldownUntil;
 }
 function parseUsageResponse(data) {
@@ -144,72 +233,85 @@ function parseUsageResponse(data) {
   }
   return { fiveHourPct, fiveHourResetMs, fiveHourResetAt, sevenDayPct };
 }
-async function fetchUsage() {
-  try {
-    const cached = readCache();
-    if (cached) return parseUsageResponse(cached.data);
-    if (isCoolingDown()) {
-      const stale = readCache(true);
-      return stale ? parseUsageResponse(stale.data) : null;
+function requestUsage(token) {
+  return fetch("https://api.anthropic.com/api/oauth/usage", {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "anthropic-beta": "oauth-2025-04-20"
     }
-    const token = getToken();
+  });
+}
+async function fetchUsage() {
+  const account = getAccount();
+  const key = cacheKey(account);
+  const withAccount = (v) => ({ ...v, account });
+  try {
+    const cached = readCache(key);
+    if (cached) return withAccount(parseUsageResponse(cached.data));
+    if (isCoolingDown(key)) {
+      const stale = readCache(key, true);
+      return stale ? withAccount(parseUsageResponse(stale.data)) : null;
+    }
+    let token = getToken();
     if (!token) return null;
-    const res = await fetch("https://api.anthropic.com/api/oauth/usage", {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "anthropic-beta": "oauth-2025-04-20"
+    let res = await requestUsage(token);
+    if (res.status === 401) {
+      const fresh = getToken(true);
+      if (fresh && fresh !== token) {
+        token = fresh;
+        res = await requestUsage(token);
       }
-    });
+    }
     if (!res.ok) {
-      const stale = readCache(true);
+      const stale = readCache(key, true);
       const staleData = stale?.data;
       const isStaleUsable = staleData && stale && Date.now() - stale.dataTimestamp < MAX_STALE_MS;
       if (res.status === 429) {
         const retryAfter = res.headers.get("retry-after");
         const cooldownMs = retryAfter ? parseInt(retryAfter, 10) * 1e3 : 6e5;
-        writeCache(staleData ?? {}, {
+        writeCache(key, staleData ?? {}, {
           cooldownUntil: Date.now() + cooldownMs,
           dataTimestamp: stale?.dataTimestamp ?? 0
         });
       } else if (isStaleUsable) {
-        writeCache(staleData, { dataTimestamp: stale.dataTimestamp });
+        writeCache(key, staleData, { dataTimestamp: stale.dataTimestamp });
       }
-      return staleData?.five_hour || staleData?.seven_day ? parseUsageResponse(staleData) : null;
+      return staleData?.five_hour || staleData?.seven_day ? withAccount(parseUsageResponse(staleData)) : null;
     }
     const data = await res.json();
-    writeCache(data);
-    return parseUsageResponse(data);
+    writeCache(key, data);
+    return withAccount(parseUsageResponse(data));
   } catch {
-    const stale = readCache(true);
+    const stale = readCache(key, true);
     if (stale) {
       if (Date.now() - stale.dataTimestamp < MAX_STALE_MS) {
-        writeCache(stale.data, { dataTimestamp: stale.dataTimestamp });
+        writeCache(key, stale.data, { dataTimestamp: stale.dataTimestamp });
       }
-      return parseUsageResponse(stale.data);
+      return withAccount(parseUsageResponse(stale.data));
     }
     return null;
   }
 }
 
 // src/setup.ts
-var import_fs2 = require("fs");
-var import_path2 = require("path");
-var import_os2 = require("os");
-var SETTINGS_PATH = (0, import_path2.join)((0, import_os2.homedir)(), ".claude", "settings.json");
+var import_fs3 = require("fs");
+var import_path3 = require("path");
+var import_os3 = require("os");
+var SETTINGS_PATH = (0, import_path3.join)((0, import_os3.homedir)(), ".claude", "settings.json");
 var STATUSLINE_COMMAND = "usage-statusbar";
 function readSettings() {
   try {
-    return JSON.parse((0, import_fs2.readFileSync)(SETTINGS_PATH, "utf8"));
+    return JSON.parse((0, import_fs3.readFileSync)(SETTINGS_PATH, "utf8"));
   } catch {
     return {};
   }
 }
 function writeSettings(settings) {
-  const dir = (0, import_path2.join)((0, import_os2.homedir)(), ".claude");
-  if (!(0, import_fs2.existsSync)(dir)) {
-    (0, import_fs2.mkdirSync)(dir, { recursive: true });
+  const dir = (0, import_path3.join)((0, import_os3.homedir)(), ".claude");
+  if (!(0, import_fs3.existsSync)(dir)) {
+    (0, import_fs3.mkdirSync)(dir, { recursive: true });
   }
-  (0, import_fs2.writeFileSync)(SETTINGS_PATH, JSON.stringify(settings, null, 2) + "\n");
+  (0, import_fs3.writeFileSync)(SETTINGS_PATH, JSON.stringify(settings, null, 2) + "\n");
 }
 function applySettings() {
   const settings = readSettings();
@@ -308,11 +410,12 @@ async function statusline() {
   const wtPrefix = wt.isWorktree ? `\u{1F33F} ${wt.branch ?? "wt"} ` : "";
   const usage = await fetchUsage();
   if (usage) {
+    const acct = renderAccount(usage.account);
     const blockBar = renderBar(usage.fiveHourPct);
     const resetTime = formatDuration(usage.fiveHourResetMs);
     const resetKST = usage.fiveHourResetAt ? formatHourKST(usage.fiveHourResetAt) : "";
     console.log(
-      `${wtPrefix}\u{1F9E0} ${contextBar}${Math.round(contextPct)}% \u23F0 ${blockBar}${Math.round(usage.fiveHourPct)}% \u{1F504} ${resetKST}(-${resetTime})`
+      `${wtPrefix}${acct}\u{1F9E0} ${contextBar}${Math.round(contextPct)}% \u23F0 ${blockBar}${Math.round(usage.fiveHourPct)}% \u{1F504} ${resetKST}(-${resetTime})`
     );
   } else {
     console.log(`${wtPrefix}\u{1F9E0} ${contextBar}${Math.round(contextPct)}%`);
