@@ -92,11 +92,13 @@ Bar characters: `█` (filled) / `░` (empty) — single-width Unicode, works o
 5. OAuth token is read from `~/.claude/.credentials.json`, falling back to the macOS
    Keychain
 
-On macOS the Keychain is the source of truth — account switchers update it without
-touching `.credentials.json`, so a file-first read can silently serve the previous
-account's token. To avoid a Keychain prompt on every refresh, the file is trusted unless
-`.claude.json` is newer than it (which means the account just changed), or the API
-answers `401`. In practice the Keychain is read about once per account switch.
+On macOS the Keychain is the source of truth and `.credentials.json` is a shadow copy.
+Whether an account switcher refreshes that shadow varies by tool and version, so a
+file-first read can silently serve the previous account's token. Reading the Keychain
+every time would instead mean a macOS access prompt on every refresh. So the shadow is
+trusted unless `.claude.json` — which switchers do update — is newer than it, or the API
+answers `401`. In practice the Keychain is read about once per account switch, and the
+check holds whether or not the switcher maintains the shadow.
 
 `CLAUDE_CONFIG_DIR` is honored throughout, so per-terminal sessions (e.g. `cswap run`)
 resolve their own profile rather than the default one.

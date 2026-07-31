@@ -1,6 +1,6 @@
 {
   "name": "@redlasha/usage-statusbar",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "description": "Claude Code statusline for subscription users — context window, 5-hour usage quota, and reset timer",
   "main": "dist/index.cjs",
   "bin": {

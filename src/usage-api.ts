@@ -109,9 +109,11 @@ function mtimeMs(path: string): number | null {
 /**
  * .credentials.json이 현재 계정 것인지 판정한다.
  *
- * macOS에서 Claude Code의 자격증명 정본은 Keychain이고, 전환 도구는 보통
- * Keychain만 갱신한다. 다만 .claude.json은 함께 갱신되므로, 그쪽이 더 새것이면
- * 자격증명 파일은 이전 계정 것으로 봐야 한다.
+ * macOS에서 자격증명 정본은 Keychain이고 .credentials.json은 그림자 사본이다.
+ * 전환 도구가 이 그림자를 함께 갱신해주는지는 도구와 버전에 따라 다르므로
+ * (claude-swap은 최신 버전에서 이미 존재하는 파일만 갱신한다) 신선도를 가정하지
+ * 않는다. 대신 계정 전환 시 갱신되는 .claude.json과 mtime을 비교해, 설정이 더
+ * 새것이면 그림자를 이전 계정 것으로 본다.
  */
 function credentialsFileLooksStale(): boolean {
   const cred = mtimeMs(CREDENTIALS_FILE);
