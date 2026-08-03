@@ -3,12 +3,18 @@
 Claude Code statusline that shows what matters for subscription users.
 
 ```
-🧠 ████░░░░░░ 42% | ⏰ █████░░░░░ 53% | 🔄 03:00 (-2h 14m)
+🌿 my-branch 👤1·personal Opus 5 🧠 ██░░░42% ⏰ ███░░53% 🔄 PM8:30(-1.4)
 ```
 
+- **🌿 Worktree** — branch name, only inside a git worktree
+- **👤 Account** — which account this session runs as, only if more than one is set up
+- **Model** — the main-loop model, colored by family
 - **🧠 Context** — context window usage %
-- **⏰ Usage** — 5-hour block usage % (Anthropic OAuth API)
-- **🔄 Reset** — reset time (KST) and countdown
+- **⏰ Usage** — 5-hour block usage %
+- **🔄 Reset** — reset time (KST) and hours remaining
+
+Sections that do not apply are omitted, so a single-account session in a plain checkout
+shows just the last three.
 
 ## Why
 
@@ -20,7 +26,8 @@ Most statusline tools focus on cost tracking. If you're on a Claude Pro/Team sub
 npm install -g @redlasha/usage-statusbar
 ```
 
-The installer will ask to configure your `~/.claude/settings.json` automatically.
+The postinstall step writes the `statusLine` entry into `~/.claude/settings.json` for
+you, and leaves it alone if one is already configured.
 
 ### Manual setup
 
@@ -39,7 +46,8 @@ If you skipped the auto-setup, add this to `~/.claude/settings.json`:
 ### Re-run setup
 
 ```bash
-usage-statusbar --setup
+usage-statusbar --setup    # write the statusLine entry
+usage-statusbar --remove   # take it back out
 ```
 
 ## Display
@@ -48,9 +56,10 @@ usage-statusbar --setup
 |---------|--------|-------------|
 | 🌿 Worktree | cwd | Branch name, shown only inside a git worktree |
 | 👤 Account | OAuth token | Which account this session runs as (see below) |
+| Model | Claude Code stdin | Main-loop model, colored by family (opus / sonnet / fable-haiku) |
 | 🧠 Context | Claude Code stdin | Context window usage percentage |
 | ⏰ Usage | Claude Code stdin (OAuth API fallback) | 5-hour rolling block utilization |
-| 🔄 Reset | Claude Code stdin (OAuth API fallback) | Next reset time (KST) and countdown |
+| 🔄 Reset | Claude Code stdin (OAuth API fallback) | Next reset time (KST) and hours remaining |
 
 ### Account indicator
 
@@ -88,7 +97,9 @@ rather than serving the previous account's quota until the cache expires.
 | 51-80% | Yellow | Moderate |
 | 81-100% | Red | High |
 
-Bar characters: `█` (filled) / `░` (empty) — single-width Unicode, works on all terminals.
+Bars are 5 cells of `█` (filled) / `░` (empty) — single-width Unicode, works on all
+terminals. The thresholds apply to the 🧠 and ⏰ bars; the model name is colored by
+family instead — opus red, sonnet yellow, fable/haiku green, anything else dim.
 
 ## How it works
 
