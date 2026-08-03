@@ -3,7 +3,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import { renderBar, renderAccount, renderModel, formatDuration } from "./render";
-import { fetchUsage } from "./usage-api";
+import { fetchUsage, type RateLimits } from "./usage-api";
 import { setup, remove } from "./setup";
 
 type StatusLineInput = {
@@ -18,6 +18,11 @@ type StatusLineInput = {
     id?: string;
     display_name?: string;
   };
+  /**
+   * Claude Code 2.1+ 가 실어 보내는 rate limit. 세션 자신의 추론 응답 헤더
+   * (anthropic-ratelimit-unified-*)에서 나오므로 조회 비용이 없고 항상 최신이다.
+   */
+  rate_limits?: RateLimits;
 };
 
 /**
@@ -118,8 +123,8 @@ async function statusline() {
   const modelName = input.model?.display_name;
   const modelPrefix = modelName ? `${renderModel(modelName)} ` : "";
 
-  // 5-hour block usage from API
-  const usage = await fetchUsage();
+  // 5-hour block usage — stdin에 실려오면 그걸 쓰고, 없을 때만 API 조회
+  const usage = await fetchUsage(input.rate_limits);
 
   if (usage) {
     const acct = renderAccount(usage.account);

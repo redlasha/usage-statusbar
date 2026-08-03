@@ -73,6 +73,20 @@ type Credentials = {
 };
 
 /**
+ * Claude Code가 statusline stdin에 실어 보내는 rate limit.
+ *
+ * 출처가 `/api/oauth/usage`가 아니라 그 세션이 방금 받은 추론 응답의
+ * `anthropic-ratelimit-unified-*` 헤더다. 그래서 별도 조회가 필요 없고, 그
+ * 세션이 실제로 쓰는 계정의 수치임이 보장되며, usage 엔드포인트가 429여도 나온다.
+ *
+ * `used_percentage`는 0~100, `resets_at`은 epoch 초 (2.1.220 기준 실측).
+ */
+export type RateLimits = {
+  five_hour?: { used_percentage?: number; resets_at?: number | string };
+  seven_day?: { used_percentage?: number; resets_at?: number | string };
+};
+
+/**
  * 계정별 캐시 키. 단일 키를 쓰면 계정 전환 후에도 이전 계정 수치가
  * TTL 동안 그대로 표시된다.
  */
@@ -250,6 +264,39 @@ function parseUsageResponse(data: UsageResponse) {
   return { fiveHourPct, fiveHourResetMs, fiveHourResetAt, sevenDayPct };
 }
 
+/** epoch 초(Claude Code) 와 ISO 문자열(OAuth API) 을 모두 받는다 */
+function parseResetsAt(value: unknown): Date | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    // 초/밀리초 어느 쪽으로 오더라도 맞게 해석한다
+    const ms = value > 1e12 ? value : value * 1000;
+    return new Date(ms);
+  }
+  if (typeof value === "string" && value) {
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+  return null;
+}
+
+/** statusline stdin의 rate limit을 표시용 값으로 (조회 없음) */
+function parseRateLimits(limits: RateLimits) {
+  const fiveHour = limits.five_hour;
+  if (!fiveHour || typeof fiveHour.used_percentage !== "number") return null;
+
+  const fiveHourResetAt = parseResetsAt(fiveHour.resets_at);
+  return {
+    fiveHourPct: fiveHour.used_percentage,
+    fiveHourResetAt,
+    fiveHourResetMs: fiveHourResetAt
+      ? Math.max(0, fiveHourResetAt.getTime() - Date.now())
+      : 0,
+    sevenDayPct:
+      typeof limits.seven_day?.used_percentage === "number"
+        ? limits.seven_day.used_percentage
+        : 0,
+  };
+}
+
 function requestUsage(token: string): Promise<Response> {
   return fetch("https://api.anthropic.com/api/oauth/usage", {
     headers: {
@@ -298,11 +345,15 @@ async function resolveSession(): Promise<{
 }
 
 /**
- * Fetch usage data from Anthropic API (with per-account file cache).
+ * 5시간 창 사용량.
  *
- * 계정 이름표와 수치는 모두 access token에서 나온다 — 둘이 어긋날 수 없다.
+ * Claude Code가 stdin으로 rate limit을 실어 보내면 그것을 쓴다 — 세션이 방금 받은
+ * 응답 헤더에서 온 값이라 조회가 필요 없고, usage 엔드포인트가 429여도 나오며,
+ * 그 세션 계정의 수치임이 보장된다. 실어 보내지 않는 버전/시점에서만 API로 간다.
+ *
+ * 계정 이름표는 access token에서 확정한다 — 수치와 어긋날 수 없다.
  */
-export async function fetchUsage(): Promise<{
+export async function fetchUsage(rateLimits?: RateLimits): Promise<{
   fiveHourPct: number;
   fiveHourResetMs: number;
   fiveHourResetAt: Date | null;
@@ -312,6 +363,18 @@ export async function fetchUsage(): Promise<{
   /** 계정을 확정하기 전에는 캐시를 꺼내 쓰지 않는다 (남의 수치를 보이는 것보다 낫다) */
   let resolved: { key: string; fp: string; account: Account | null } | null =
     null;
+
+  const fromSession = rateLimits ? parseRateLimits(rateLimits) : null;
+  if (fromSession) {
+    // 이름표는 최선으로만 붙인다 — 못 붙여도 수치 자체는 이 세션 것이라 유효하다
+    let account: Account | null = null;
+    try {
+      account = (await resolveSession())?.account ?? null;
+    } catch {
+      // 이름표 없이 표시
+    }
+    return { ...fromSession, account };
+  }
 
   try {
     const session = await resolveSession();

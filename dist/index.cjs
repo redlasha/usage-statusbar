@@ -346,6 +346,28 @@ function parseUsageResponse(data) {
   }
   return { fiveHourPct, fiveHourResetMs, fiveHourResetAt, sevenDayPct };
 }
+function parseResetsAt(value) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const ms = value > 1e12 ? value : value * 1e3;
+    return new Date(ms);
+  }
+  if (typeof value === "string" && value) {
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+  return null;
+}
+function parseRateLimits(limits) {
+  const fiveHour = limits.five_hour;
+  if (!fiveHour || typeof fiveHour.used_percentage !== "number") return null;
+  const fiveHourResetAt = parseResetsAt(fiveHour.resets_at);
+  return {
+    fiveHourPct: fiveHour.used_percentage,
+    fiveHourResetAt,
+    fiveHourResetMs: fiveHourResetAt ? Math.max(0, fiveHourResetAt.getTime() - Date.now()) : 0,
+    sevenDayPct: typeof limits.seven_day?.used_percentage === "number" ? limits.seven_day.used_percentage : 0
+  };
+}
 function requestUsage(token) {
   return fetch("https://api.anthropic.com/api/oauth/usage", {
     headers: {
@@ -375,8 +397,17 @@ async function resolveSession() {
   }
   return { creds, fp, account };
 }
-async function fetchUsage() {
+async function fetchUsage(rateLimits) {
   let resolved = null;
+  const fromSession = rateLimits ? parseRateLimits(rateLimits) : null;
+  if (fromSession) {
+    let account = null;
+    try {
+      account = (await resolveSession())?.account ?? null;
+    } catch {
+    }
+    return { ...fromSession, account };
+  }
   try {
     const session = await resolveSession();
     if (!session) return null;
@@ -560,7 +591,7 @@ async function statusline() {
   const wtPrefix = wt.isWorktree ? `\u{1F33F} ${wt.branch ?? "wt"} ` : "";
   const modelName = input.model?.display_name;
   const modelPrefix = modelName ? `${renderModel(modelName)} ` : "";
-  const usage = await fetchUsage();
+  const usage = await fetchUsage(input.rate_limits);
   if (usage) {
     const acct = renderAccount(usage.account);
     const blockBar = renderBar(usage.fiveHourPct);

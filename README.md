@@ -49,8 +49,8 @@ usage-statusbar --setup
 | 🌿 Worktree | cwd | Branch name, shown only inside a git worktree |
 | 👤 Account | OAuth token | Which account this session runs as (see below) |
 | 🧠 Context | Claude Code stdin | Context window usage percentage |
-| ⏰ Usage | Anthropic OAuth API | 5-hour rolling block utilization |
-| 🔄 Reset | Anthropic OAuth API | Next reset time (KST) and countdown |
+| ⏰ Usage | Claude Code stdin (OAuth API fallback) | 5-hour rolling block utilization |
+| 🔄 Reset | Claude Code stdin (OAuth API fallback) | Next reset time (KST) and countdown |
 
 ### Account indicator
 
@@ -94,12 +94,34 @@ Bar characters: `█` (filled) / `░` (empty) — single-width Unicode, works o
 
 1. Claude Code pipes JSON session data to the statusline command via stdin
 2. Context window % is extracted from the JSON
-3. The OAuth token is read from `<profile>/.credentials.json`, falling back to the macOS
-   Keychain **only for the default profile** (see below)
-4. The token's org is resolved via `api.anthropic.com/api/oauth/profile`, cached by token
-   fingerprint in `<profile>/.claude-identity-cache.json`
-5. Usage quota % and reset time are fetched from `api.anthropic.com/api/oauth/usage`,
+3. Usage quota % and reset time come from that same JSON (`rate_limits`) when present —
+   see below. Otherwise they are fetched from `api.anthropic.com/api/oauth/usage` and
    cached per account in `<profile>/.claude-usage-cache.json`
+4. The OAuth token is read from `<profile>/.credentials.json`, falling back to the macOS
+   Keychain **only for the default profile** (see below)
+5. The token's org is resolved via `api.anthropic.com/api/oauth/profile`, cached by token
+   fingerprint in `<profile>/.claude-identity-cache.json`
+
+### Usage comes from the session, not a poll
+
+Claude Code 2.1+ puts the current limits on the statusline payload:
+
+```json
+"rate_limits": {
+  "five_hour": { "used_percentage": 23, "resets_at": 1785756600 },
+  "seven_day": { "used_percentage": 2,  "resets_at": 1786305600 }
+}
+```
+
+It builds those from the `anthropic-ratelimit-unified-*` headers on the session's own
+inference responses, so they cost nothing to read, are as fresh as the last message, and
+are unambiguously the account the session is actually running as. (`used_percentage` is
+0–100; `resets_at` is epoch seconds — an ISO string is also accepted.)
+
+Polling `/api/oauth/usage` instead meant every session and every account switcher shared
+one per-token budget, and hitting it returned `429` with the quota numbers unavailable
+right when you wanted them. That endpoint is now only a fallback for payloads without
+`rate_limits` — an older Claude Code, or a session that has not made a request yet.
 
 `CLAUDE_CONFIG_DIR` is honored throughout, so per-terminal sessions (e.g. `cswap run`,
 `cswap map`) resolve their own profile rather than the default one.
