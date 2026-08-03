@@ -1,16 +1,37 @@
-import { readFileSync, writeFileSync, mkdirSync, statSync } from "fs";
+import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { execFileSync } from "child_process";
-import { join } from "path";
-import { homedir } from "os";
-import { getAccount, type Account } from "./account";
+import { createHash } from "crypto";
+import { getAccountFromConfig, type Account } from "./account";
+import {
+  resolveAccount,
+  blockToken,
+  isTokenBlocked,
+  markKeychainChecked,
+  keychainCheckedRecently,
+} from "./identity";
+import {
+  CACHE_FILE,
+  CONFIG_DIR,
+  CREDENTIALS_FILE,
+  IS_DEFAULT_PROFILE,
+} from "./profile";
 
 const CACHE_TTL_MS = 300_000; // 5 minutes
 const MAX_STALE_MS = 3_600_000; // 1 hour — stale data older than this is discarded
-/** cswap run 같은 세션 모드에서는 프로필 디렉터리가 다르므로 env를 존중해야 한다 */
-const CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude");
-const CACHE_FILE = join(CONFIG_DIR, ".claude-usage-cache.json");
-const CREDENTIALS_FILE = join(CONFIG_DIR, ".credentials.json");
-const CLAUDE_JSON = join(process.env.CLAUDE_CONFIG_DIR ?? homedir(), ".claude.json");
+const REQUEST_TIMEOUT_MS = 3000; // statusline은 매 렌더 호출되므로 매달리면 안 된다
+
+/**
+ * 429 쿨다운 범위.
+ *
+ * `retry-after`를 그대로 믿으면 무너진다: 이 엔드포인트는 429를 유지한 채로
+ * `retry-after: 0`을 돌려주는 것이 관측됐고(그러면 쿨다운이 0초가 된다),
+ * HTTP-date 형식이면 `parseInt`가 NaN을 낸다. 어느 쪽이든 백오프가 사라져
+ * 렌더마다 429를 다시 맞으러 간다. 그래서 양수일 때만 값을 따르고, 그마저도
+ * 하한·상한 안으로 가둔다.
+ */
+const MIN_COOLDOWN_MS = 30_000;
+const MAX_COOLDOWN_MS = 1_800_000;
+const DEFAULT_COOLDOWN_MS = 600_000;
 
 /**
  * 계정을 모르던 시절의 키. ai-usage-monitor가 이 키를 읽으므로
@@ -36,10 +57,20 @@ type CacheEntry = {
   timestamp: number;
   dataTimestamp: number;
   cooldownUntil?: number;
+  /**
+   * 이 데이터를 받아올 때 쓴 access token의 지문.
+   * 다른 토큰으로 받은 값(과거 오염분 포함)을 재사용하지 않기 위한 안전장치.
+   */
+  tokenFp?: string;
   data: UsageResponse;
 };
 
 type CacheStore = Record<string, CacheEntry>;
+
+type Credentials = {
+  accessToken: string;
+  expiresAt?: number;
+};
 
 /**
  * 계정별 캐시 키. 단일 키를 쓰면 계정 전환 후에도 이전 계정 수치가
@@ -49,23 +80,45 @@ function cacheKey(account: Account | null): string {
   return account ? `${LEGACY_CACHE_KEY}:${account.orgUuid}` : LEGACY_CACHE_KEY;
 }
 
-/**
- * Get Claude Code OAuth token from credentials file (Linux/Windows)
- */
-function getTokenFromCredentialsFile(): string | null {
+function fingerprint(token: string): string {
+  return createHash("sha256").update(token).digest("hex").slice(0, 16);
+}
+
+function parseCredentials(raw: string): Credentials | null {
   try {
-    const creds = JSON.parse(readFileSync(CREDENTIALS_FILE, "utf8"));
-    return creds?.claudeAiOauth?.accessToken ?? null;
+    const oauth = JSON.parse(raw)?.claudeAiOauth;
+    const accessToken = oauth?.accessToken;
+    if (typeof accessToken !== "string" || !accessToken) return null;
+    return {
+      accessToken,
+      expiresAt:
+        typeof oauth?.expiresAt === "number" ? oauth.expiresAt : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** 이 프로필이 소유한 자격증명 파일 */
+function readCredentialsFile(): Credentials | null {
+  try {
+    return parseCredentials(readFileSync(CREDENTIALS_FILE, "utf8"));
   } catch {
     return null;
   }
 }
 
 /**
- * Get Claude Code OAuth token from macOS Keychain.
- * 읽은 값은 파일로도 복사해 다음 조회부터는 Keychain을 건드리지 않게 한다.
+ * macOS Keychain의 자격증명.
+ *
+ * "Claude Code-credentials" 아이템은 시스템에 하나뿐이라 항상 "전역 활성 계정"
+ * 것이다. 그래서 기본 프로필에서만 읽고, 그림자 파일 갱신도 기본 프로필에서만
+ * 한다 — 별도 프로필(CLAUDE_CONFIG_DIR)의 자격증명 파일을 이 값으로 덮어쓰면
+ * 그 세션이 다음 기동에서 남의 계정으로 붙는다.
  */
-function getTokenFromKeychain(): string | null {
+function readCredentialsFromKeychain(): Credentials | null {
+  if (!IS_DEFAULT_PROFILE) return null;
+
   try {
     // 셸을 거치지 않도록 execFile 사용 (인자 배열 전달)
     const result = execFileSync(
@@ -77,71 +130,39 @@ function getTokenFromKeychain(): string | null {
         timeout: KEYCHAIN_TIMEOUT_MS,
       }
     ).trim();
-    const creds = JSON.parse(result);
-    const token = creds?.claudeAiOauth?.accessToken ?? null;
 
-    if (token) {
-      try {
-        mkdirSync(CONFIG_DIR, { recursive: true });
-        writeFileSync(CREDENTIALS_FILE, JSON.stringify(creds, null, 2), {
-          encoding: "utf8",
-          mode: 0o600,
-        });
-      } catch {
-        // best-effort
-      }
+    const creds = parseCredentials(result);
+    if (!creds) return null;
+
+    try {
+      mkdirSync(CONFIG_DIR, { recursive: true });
+      writeFileSync(CREDENTIALS_FILE, result, { encoding: "utf8", mode: 0o600 });
+    } catch {
+      // best-effort
     }
 
-    return token;
-  } catch {
-    return null;
-  }
-}
-
-function mtimeMs(path: string): number | null {
-  try {
-    return statSync(path).mtimeMs;
+    return creds;
   } catch {
     return null;
   }
 }
 
 /**
- * .credentials.json이 현재 계정 것인지 판정한다.
+ * 이 프로필의 자격증명.
  *
- * macOS에서 자격증명 정본은 Keychain이고 .credentials.json은 그림자 사본이다.
- * 전환 도구가 이 그림자를 함께 갱신해주는지는 도구와 버전에 따라 다르므로
- * (claude-swap은 최신 버전에서 이미 존재하는 파일만 갱신한다) 신선도를 가정하지
- * 않는다. 대신 계정 전환 시 갱신되는 .claude.json과 mtime을 비교해, 설정이 더
- * 새것이면 그림자를 이전 계정 것으로 본다.
+ * 별도 프로필에서는 자기 .credentials.json만이 정본이다. 파일이 없다고 Keychain으로
+ * 폴백하면 전역 활성 계정 토큰을 집어오게 되므로, 차라리 usage 표시를 포기한다.
  */
-function credentialsFileLooksStale(): boolean {
-  const cred = mtimeMs(CREDENTIALS_FILE);
-  if (cred === null) return true;
+function getCredentials(): Credentials | null {
+  const fromFile = readCredentialsFile();
+  if (!IS_DEFAULT_PROFILE) return fromFile;
 
-  const config = mtimeMs(CLAUDE_JSON);
-  if (config === null) return false;
-
-  return config > cred;
-}
-
-/**
- * Get Claude Code OAuth token.
- *
- * Keychain이 정본이지만 조회할 때마다 접근 승인 다이얼로그가 뜰 수 있어서,
- * 전환이 의심될 때만 조회한다. Keychain을 읽으면 파일도 갱신되므로
- * 실질적으로 "전환당 1회"로 수렴한다.
- */
-function getToken(forceKeychain = false): string | null {
-  if (process.platform !== "darwin") {
-    return getTokenFromCredentialsFile() ?? getTokenFromKeychain();
+  const expired =
+    fromFile?.expiresAt !== undefined && fromFile.expiresAt <= Date.now();
+  if (!fromFile || expired) {
+    return readCredentialsFromKeychain() ?? fromFile;
   }
-
-  if (forceKeychain || credentialsFileLooksStale()) {
-    return getTokenFromKeychain() ?? getTokenFromCredentialsFile();
-  }
-
-  return getTokenFromCredentialsFile() ?? getTokenFromKeychain();
+  return fromFile;
 }
 
 function readStore(): CacheStore {
@@ -171,10 +192,26 @@ function readCache(key: string, staleOk = false): CacheEntry | null {
   return entry;
 }
 
+/**
+ * 현재 토큰으로 받은 것이 확실한 캐시만 반환.
+ *
+ * tokenFp가 없는 엔트리는 지문 도입 이전(또는 오염된) 값이라 신뢰하지 않는다 —
+ * 한 번 더 조회하면 스스로 복구된다.
+ */
+function readVerifiedCache(
+  key: string,
+  fp: string,
+  staleOk = false
+): CacheEntry | null {
+  const entry = readCache(key, staleOk);
+  if (!entry) return null;
+  return entry.tokenFp === fp ? entry : null;
+}
+
 function writeCache(
   key: string,
   data: UsageResponse,
-  options?: { cooldownUntil?: number; dataTimestamp?: number }
+  options?: { cooldownUntil?: number; dataTimestamp?: number; tokenFp?: string }
 ): void {
   const store = readStore();
   const now = Date.now();
@@ -183,6 +220,7 @@ function writeCache(
     dataTimestamp: options?.dataTimestamp ?? now,
     data,
   };
+  if (options?.tokenFp) entry.tokenFp = options.tokenFp;
   if (options?.cooldownUntil) entry.cooldownUntil = options.cooldownUntil;
 
   store[key] = entry;
@@ -218,11 +256,51 @@ function requestUsage(token: string): Promise<Response> {
       Authorization: `Bearer ${token}`,
       "anthropic-beta": "oauth-2025-04-20",
     },
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
 }
 
 /**
- * Fetch usage data from Anthropic API (with per-account file cache)
+ * 세션이 실제로 쓰는 자격증명과 그 계정을 확정한다.
+ *
+ * 기본 프로필에서는 그림자 파일이 전환 이전 것일 수 있다. 예전에는 .claude.json과
+ * mtime을 비교해 이를 감지했는데, .claude.json은 실행 중인 Claude Code가 수 초마다
+ * 다시 쓰기 때문에 사실상 항상 "전환됨"으로 오판했다 (매 렌더 Keychain 호출).
+ * 이제는 토큰이 말하는 org와 .claude.json이 말하는 org가 실제로 다를 때만 조회한다.
+ */
+async function resolveSession(): Promise<{
+  creds: Credentials;
+  fp: string;
+  account: Account | null;
+} | null> {
+  let creds = getCredentials();
+  if (!creds) return null;
+
+  let fp = fingerprint(creds.accessToken);
+  let account = await resolveAccount(creds.accessToken, fp);
+
+  if (IS_DEFAULT_PROFILE && account && !keychainCheckedRecently(fp)) {
+    const claimed = getAccountFromConfig();
+    if (claimed && claimed.orgUuid !== account.orgUuid) {
+      const fresh = readCredentialsFromKeychain();
+      if (fresh && fresh.accessToken !== creds.accessToken) {
+        creds = fresh;
+        fp = fingerprint(fresh.accessToken);
+        account = await resolveAccount(fresh.accessToken, fp);
+      } else {
+        // Keychain에도 새 토큰이 없다 — .claude.json 쪽이 틀린 것이니 그만 묻는다
+        markKeychainChecked(fp);
+      }
+    }
+  }
+
+  return { creds, fp, account };
+}
+
+/**
+ * Fetch usage data from Anthropic API (with per-account file cache).
+ *
+ * 계정 이름표와 수치는 모두 access token에서 나온다 — 둘이 어긋날 수 없다.
  */
 export async function fetchUsage(): Promise<{
   fiveHourPct: number;
@@ -231,53 +309,70 @@ export async function fetchUsage(): Promise<{
   sevenDayPct: number;
   account: Account | null;
 } | null> {
-  const account = getAccount();
-  const key = cacheKey(account);
-  const withAccount = <T extends object>(v: T) => ({ ...v, account });
+  /** 계정을 확정하기 전에는 캐시를 꺼내 쓰지 않는다 (남의 수치를 보이는 것보다 낫다) */
+  let resolved: { key: string; fp: string; account: Account | null } | null =
+    null;
 
   try {
-    // Check cache first (includes cooldown check)
-    const cached = readCache(key);
+    const session = await resolveSession();
+    if (!session) return null;
+
+    let { creds, fp, account } = session;
+    let key = cacheKey(account);
+    resolved = { key, fp, account };
+    const withAccount = <T extends object>(v: T) => ({ ...v, account });
+
+    const cached = readVerifiedCache(key, fp);
     if (cached) return withAccount(parseUsageResponse(cached.data));
 
-    // During cooldown, skip API call and use stale cache
-    if (isCoolingDown(key)) {
-      const stale = readCache(key, true);
+    // 429 쿨다운 / 인증 거절 backoff 중에는 조회하지 않고 직전 수치로 버틴다
+    if (isCoolingDown(key) || isTokenBlocked(fp)) {
+      const stale = readVerifiedCache(key, fp, true);
       return stale ? withAccount(parseUsageResponse(stale.data)) : null;
     }
 
-    let token = getToken();
-    if (!token) return null;
+    let res = await requestUsage(creds.accessToken);
 
-    let res = await requestUsage(token);
-
-    // 파일의 토큰이 만료됐을 수 있다 — Keychain으로 한 번만 재시도
-    if (res.status === 401) {
-      const fresh = getToken(true);
-      if (fresh && fresh !== token) {
-        token = fresh;
-        res = await requestUsage(token);
+    // 그림자 파일 토큰이 폐기됐을 수 있다 — 기본 프로필이면 Keychain으로 한 번만 재시도
+    if (res.status === 401 && IS_DEFAULT_PROFILE) {
+      blockToken(fp); // 이 토큰은 확실히 죽었다
+      const fresh = readCredentialsFromKeychain();
+      if (fresh && fresh.accessToken !== creds.accessToken) {
+        creds = fresh;
+        fp = fingerprint(fresh.accessToken);
+        account = await resolveAccount(fresh.accessToken, fp);
+        key = cacheKey(account);
+        resolved = { key, fp, account };
+        res = await requestUsage(fresh.accessToken);
       }
     }
 
     if (!res.ok) {
-      const stale = readCache(key, true);
+      const stale = readVerifiedCache(key, fp, true);
       const staleData = stale?.data;
       const isStaleUsable =
         staleData && stale && Date.now() - stale.dataTimestamp < MAX_STALE_MS;
 
+      // 인증 거절은 다음 렌더에 재시도해도 결과가 같다 — 잠시 쉰다
+      if (res.status === 401 || res.status === 403) blockToken(fp);
+
       if (res.status === 429) {
-        const retryAfter = res.headers.get("retry-after");
-        const cooldownMs = retryAfter
-          ? parseInt(retryAfter, 10) * 1000
-          : 600_000; // default 10 minutes
+        const seconds = Number.parseInt(res.headers.get("retry-after") ?? "", 10);
+        const cooldownMs =
+          Number.isFinite(seconds) && seconds > 0
+            ? Math.min(Math.max(seconds * 1000, MIN_COOLDOWN_MS), MAX_COOLDOWN_MS)
+            : DEFAULT_COOLDOWN_MS;
         writeCache(key, staleData ?? {}, {
           cooldownUntil: Date.now() + cooldownMs,
           dataTimestamp: stale?.dataTimestamp ?? 0,
+          tokenFp: staleData ? fp : undefined,
         });
       } else if (isStaleUsable) {
         // Other errors: refresh timestamp to avoid immediate retry
-        writeCache(key, staleData!, { dataTimestamp: stale!.dataTimestamp });
+        writeCache(key, staleData!, {
+          dataTimestamp: stale!.dataTimestamp,
+          tokenFp: fp,
+        });
       }
 
       return staleData?.five_hour || staleData?.seven_day
@@ -286,18 +381,22 @@ export async function fetchUsage(): Promise<{
     }
 
     const data: UsageResponse = await res.json();
-    writeCache(key, data);
+    writeCache(key, data, { tokenFp: fp });
 
     return withAccount(parseUsageResponse(data));
   } catch {
-    // Network error: re-save stale data only if it's fresh enough
-    const stale = readCache(key, true);
-    if (stale) {
-      if (Date.now() - stale.dataTimestamp < MAX_STALE_MS) {
-        writeCache(key, stale.data, { dataTimestamp: stale.dataTimestamp });
-      }
-      return withAccount(parseUsageResponse(stale.data));
+    // 네트워크 오류/타임아웃: 계정을 확정한 경우에만 직전 수치를 재사용한다
+    if (!resolved) return null;
+
+    const stale = readVerifiedCache(resolved.key, resolved.fp, true);
+    if (!stale) return null;
+
+    if (Date.now() - stale.dataTimestamp < MAX_STALE_MS) {
+      writeCache(resolved.key, stale.data, {
+        dataTimestamp: stale.dataTimestamp,
+        tokenFp: stale.tokenFp,
+      });
     }
-    return null;
+    return { ...parseUsageResponse(stale.data), account: resolved.account };
   }
 }

@@ -47,7 +47,7 @@ usage-statusbar --setup
 | Section | Source | Description |
 |---------|--------|-------------|
 | 🌿 Worktree | cwd | Branch name, shown only inside a git worktree |
-| 👤 Account | `~/.claude.json` | Which account this session runs as (see below) |
+| 👤 Account | OAuth token | Which account this session runs as (see below) |
 | 🧠 Context | Claude Code stdin | Context window usage percentage |
 | ⏰ Usage | Anthropic OAuth API | 5-hour rolling block utilization |
 | 🔄 Reset | Anthropic OAuth API | Next reset time (KST) and countdown |
@@ -69,6 +69,14 @@ resolved from `~/.claude-swap-backup/sequence.json` and prefixed to the label. W
 it, only the org name is shown. The section disappears entirely if the account cannot be
 determined.
 
+The org is resolved from the **access token itself** (`/api/oauth/profile`), not from
+what `.claude.json` claims. Those two can disagree — while a switch is in flight, or when
+a profile's credentials belong to another account — and when they did, the statusline
+showed one account's name above another account's quota. Deriving both from the token
+makes that impossible; `.claude.json` is only a fallback when the token cannot be
+resolved. The token→org answer is cached by token fingerprint, so this costs one extra
+request per new token, not per refresh.
+
 Usage is cached **per account**, so switching accounts updates the numbers immediately
 rather than serving the previous account's quota until the cache expires.
 
@@ -86,22 +94,34 @@ Bar characters: `█` (filled) / `░` (empty) — single-width Unicode, works o
 
 1. Claude Code pipes JSON session data to the statusline command via stdin
 2. Context window % is extracted from the JSON
-3. The active account is read from `~/.claude.json` (`oauthAccount.organizationUuid`)
-4. Usage quota % and reset time are fetched from `api.anthropic.com/api/oauth/usage`,
-   cached per account in `~/.claude/.claude-usage-cache.json`
-5. OAuth token is read from `~/.claude/.credentials.json`, falling back to the macOS
-   Keychain
+3. The OAuth token is read from `<profile>/.credentials.json`, falling back to the macOS
+   Keychain **only for the default profile** (see below)
+4. The token's org is resolved via `api.anthropic.com/api/oauth/profile`, cached by token
+   fingerprint in `<profile>/.claude-identity-cache.json`
+5. Usage quota % and reset time are fetched from `api.anthropic.com/api/oauth/usage`,
+   cached per account in `<profile>/.claude-usage-cache.json`
 
-On macOS the Keychain is the source of truth and `.credentials.json` is a shadow copy.
-Whether an account switcher refreshes that shadow varies by tool and version, so a
-file-first read can silently serve the previous account's token. Reading the Keychain
-every time would instead mean a macOS access prompt on every refresh. So the shadow is
-trusted unless `.claude.json` — which switchers do update — is newer than it, or the API
-answers `401`. In practice the Keychain is read about once per account switch, and the
-check holds whether or not the switcher maintains the shadow.
+`CLAUDE_CONFIG_DIR` is honored throughout, so per-terminal sessions (e.g. `cswap run`,
+`cswap map`) resolve their own profile rather than the default one.
 
-`CLAUDE_CONFIG_DIR` is honored throughout, so per-terminal sessions (e.g. `cswap run`)
-resolve their own profile rather than the default one.
+### Why the Keychain is default-profile only
+
+On macOS the Keychain holds a single `Claude Code-credentials` item, and it always
+belongs to whichever account is *globally* active. A non-default profile is a different
+account by construction, so reading that item there hands the profile someone else's
+token — and the old shadow-copy write then persisted it into the profile's
+`.credentials.json`, which is enough to make the next launch of that session run as the
+wrong account. So the Keychain is now consulted, and the shadow copy written, only when
+the profile *is* `~/.claude`. A non-default profile owns its own `.credentials.json`; if
+it is missing or expired the usage sections are omitted rather than filled in from
+another account.
+
+For the default profile the shadow copy can still lag behind a switch. That used to be
+detected by comparing mtimes against `.claude.json`, but a running Claude Code rewrites
+that file every few seconds, so the check read as "switched" on nearly every refresh —
+a Keychain call per render that still never caught the switch. It now compares the org
+the *token* resolves to against the org `.claude.json` claims, and only consults the
+Keychain when they genuinely differ (or the token is expired, or the API answers `401`).
 
 ## Requirements
 

@@ -1,6 +1,5 @@
 import { readFileSync } from "fs";
-import { join } from "path";
-import { homedir } from "os";
+import { CLAUDE_JSON, SWAP_SEQUENCE } from "./profile";
 
 /**
  * 현재 Claude Code 세션이 어느 계정으로 도는지 판별한다.
@@ -8,13 +7,10 @@ import { homedir } from "os";
  * 한 사람이 개인 org와 팀 org를 함께 쓰면 이메일이 같으므로,
  * 유일한 판별자는 organizationUuid다.
  *
- * claude-swap 같은 전환 도구는 계정을 바꿀 때 .claude.json을 갱신하므로,
- * 이 파일이 전환을 가장 싸게 감지할 수 있는 소스다.
+ * 정본은 access token이다 (identity.ts가 토큰으로 org를 확정한다). .claude.json은
+ * 토큰으로 확정하지 못할 때만 쓰는 폴백인데, 이 파일은 "그 프로필이 어느 계정이라고
+ * 주장하는가"일 뿐 실제로 어느 계정 쿼터를 쓰는지와 어긋날 수 있다.
  */
-
-/** CLAUDE_CONFIG_DIR가 있으면 그 안, 없으면 $HOME 바로 아래 (Claude Code 규칙) */
-const CLAUDE_JSON = join(process.env.CLAUDE_CONFIG_DIR ?? homedir(), ".claude.json");
-const SWAP_SEQUENCE = join(homedir(), ".claude-swap-backup", "sequence.json");
 
 export type Account = {
   /** 계정 판별자 겸 캐시 키 */
@@ -45,20 +41,25 @@ function findSlot(orgUuid: string): number | null {
   return null;
 }
 
-export function getAccount(): Account | null {
+/** org 식별자에 표시용 정보(슬롯/짧은 이름)를 붙인다 */
+export function toAccount(orgUuid: string, orgName: string): Account {
+  return {
+    orgUuid,
+    orgName,
+    slot: findSlot(orgUuid),
+    label: shortLabel(orgName),
+  };
+}
+
+/** 폴백: 프로필의 .claude.json이 주장하는 계정 */
+export function getAccountFromConfig(): Account | null {
   try {
     const config = JSON.parse(readFileSync(CLAUDE_JSON, "utf8"));
     const orgUuid = config?.oauthAccount?.organizationUuid;
     if (!orgUuid) return null;
 
     const orgName = config?.oauthAccount?.organizationName ?? "unknown";
-
-    return {
-      orgUuid,
-      orgName,
-      slot: findSlot(orgUuid),
-      label: shortLabel(orgName),
-    };
+    return toAccount(orgUuid, orgName);
   } catch {
     return null;
   }

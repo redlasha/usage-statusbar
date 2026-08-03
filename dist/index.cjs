@@ -72,24 +72,47 @@ function formatDuration(ms) {
 }
 
 // src/usage-api.ts
-var import_fs2 = require("fs");
+var import_fs4 = require("fs");
 var import_child_process = require("child_process");
-var import_path2 = require("path");
-var import_os2 = require("os");
+var import_crypto = require("crypto");
 
 // src/account.ts
+var import_fs2 = require("fs");
+
+// src/profile.ts
 var import_fs = require("fs");
 var import_path = require("path");
 var import_os = require("os");
-var CLAUDE_JSON = (0, import_path.join)(process.env.CLAUDE_CONFIG_DIR ?? (0, import_os.homedir)(), ".claude.json");
-var SWAP_SEQUENCE = (0, import_path.join)((0, import_os.homedir)(), ".claude-swap-backup", "sequence.json");
+var DEFAULT_CONFIG_DIR = (0, import_path.join)((0, import_os.homedir)(), ".claude");
+var CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR ?? DEFAULT_CONFIG_DIR;
+function canonical(path2) {
+  try {
+    return (0, import_fs.realpathSync)(path2);
+  } catch {
+    return (0, import_path.resolve)(path2);
+  }
+}
+var IS_DEFAULT_PROFILE = canonical(CONFIG_DIR) === canonical(DEFAULT_CONFIG_DIR);
+var CLAUDE_JSON = (0, import_path.join)(
+  process.env.CLAUDE_CONFIG_DIR ?? (0, import_os.homedir)(),
+  ".claude.json"
+);
+var CREDENTIALS_FILE = (0, import_path.join)(CONFIG_DIR, ".credentials.json");
+var CACHE_FILE = (0, import_path.join)(CONFIG_DIR, ".claude-usage-cache.json");
+var SWAP_SEQUENCE = (0, import_path.join)(
+  (0, import_os.homedir)(),
+  ".claude-swap-backup",
+  "sequence.json"
+);
+
+// src/account.ts
 function shortLabel(orgName) {
   if (/'s Organization$/.test(orgName)) return "personal";
   return orgName.length > 12 ? `${orgName.slice(0, 12)}\u2026` : orgName;
 }
 function findSlot(orgUuid) {
   try {
-    const seq = JSON.parse((0, import_fs.readFileSync)(SWAP_SEQUENCE, "utf8"));
+    const seq = JSON.parse((0, import_fs2.readFileSync)(SWAP_SEQUENCE, "utf8"));
     for (const [num, acct] of Object.entries(seq?.accounts ?? {})) {
       if (acct?.organizationUuid === orgUuid) return Number(num);
     }
@@ -97,44 +120,144 @@ function findSlot(orgUuid) {
   }
   return null;
 }
-function getAccount() {
+function toAccount(orgUuid, orgName) {
+  return {
+    orgUuid,
+    orgName,
+    slot: findSlot(orgUuid),
+    label: shortLabel(orgName)
+  };
+}
+function getAccountFromConfig() {
   try {
-    const config = JSON.parse((0, import_fs.readFileSync)(CLAUDE_JSON, "utf8"));
+    const config = JSON.parse((0, import_fs2.readFileSync)(CLAUDE_JSON, "utf8"));
     const orgUuid = config?.oauthAccount?.organizationUuid;
     if (!orgUuid) return null;
     const orgName = config?.oauthAccount?.organizationName ?? "unknown";
-    return {
-      orgUuid,
-      orgName,
-      slot: findSlot(orgUuid),
-      label: shortLabel(orgName)
-    };
+    return toAccount(orgUuid, orgName);
   } catch {
     return null;
   }
 }
 
+// src/identity.ts
+var import_fs3 = require("fs");
+var import_path2 = require("path");
+var IDENTITY_FILE = (0, import_path2.join)(CONFIG_DIR, ".claude-identity-cache.json");
+var REQUEST_TIMEOUT_MS = 3e3;
+var AUTH_BACKOFF_MS = 6e5;
+var KEYCHAIN_RECHECK_MS = 6e4;
+function readStore() {
+  try {
+    return JSON.parse((0, import_fs3.readFileSync)(IDENTITY_FILE, "utf8"));
+  } catch {
+    return {};
+  }
+}
+function writeStore(store) {
+  try {
+    (0, import_fs3.mkdirSync)(CONFIG_DIR, { recursive: true });
+    (0, import_fs3.writeFileSync)(IDENTITY_FILE, JSON.stringify(store), {
+      encoding: "utf8",
+      mode: 384
+    });
+  } catch {
+  }
+}
+function putState(fp, patch) {
+  const store = readStore();
+  const entries = Object.entries(store).filter(([key]) => key !== fp).slice(-15);
+  writeStore({
+    ...Object.fromEntries(entries),
+    [fp]: { ...store[fp], ...patch }
+  });
+}
+function blockToken(tokenFp) {
+  putState(tokenFp, { blockedUntil: Date.now() + AUTH_BACKOFF_MS });
+}
+function isTokenBlocked(tokenFp) {
+  const state = readStore()[tokenFp];
+  return !!state?.blockedUntil && Date.now() < state.blockedUntil;
+}
+function markKeychainChecked(tokenFp) {
+  putState(tokenFp, { keychainCheckedUntil: Date.now() + KEYCHAIN_RECHECK_MS });
+}
+function keychainCheckedRecently(tokenFp) {
+  const state = readStore()[tokenFp];
+  return !!state?.keychainCheckedUntil && Date.now() < state.keychainCheckedUntil;
+}
+async function fetchIdentity(token) {
+  try {
+    const res = await fetch("https://api.anthropic.com/api/oauth/profile", {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "anthropic-beta": "oauth-2025-04-20"
+      },
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+    });
+    if (res.status === 401 || res.status === 403) return "unauthorized";
+    if (!res.ok) return null;
+    const data = await res.json();
+    const orgUuid = data?.organization?.uuid;
+    if (typeof orgUuid !== "string" || !orgUuid) return null;
+    return { orgUuid, orgName: data?.organization?.name ?? "unknown" };
+  } catch {
+    return null;
+  }
+}
+async function resolveAccount(token, tokenFp) {
+  const state = readStore()[tokenFp];
+  if (state?.orgUuid) return toAccount(state.orgUuid, state.orgName ?? "unknown");
+  if (isTokenBlocked(tokenFp)) return getAccountFromConfig();
+  const identity = await fetchIdentity(token);
+  if (identity === "unauthorized") {
+    blockToken(tokenFp);
+    return getAccountFromConfig();
+  }
+  if (identity?.orgUuid) {
+    putState(tokenFp, identity);
+    return toAccount(identity.orgUuid, identity.orgName ?? "unknown");
+  }
+  return getAccountFromConfig();
+}
+
 // src/usage-api.ts
 var CACHE_TTL_MS = 3e5;
 var MAX_STALE_MS = 36e5;
-var CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR ?? (0, import_path2.join)((0, import_os2.homedir)(), ".claude");
-var CACHE_FILE = (0, import_path2.join)(CONFIG_DIR, ".claude-usage-cache.json");
-var CREDENTIALS_FILE = (0, import_path2.join)(CONFIG_DIR, ".credentials.json");
-var CLAUDE_JSON2 = (0, import_path2.join)(process.env.CLAUDE_CONFIG_DIR ?? (0, import_os2.homedir)(), ".claude.json");
+var REQUEST_TIMEOUT_MS2 = 3e3;
+var MIN_COOLDOWN_MS = 3e4;
+var MAX_COOLDOWN_MS = 18e5;
+var DEFAULT_COOLDOWN_MS = 6e5;
 var LEGACY_CACHE_KEY = "claude_usage";
 var KEYCHAIN_TIMEOUT_MS = 2e3;
 function cacheKey(account) {
   return account ? `${LEGACY_CACHE_KEY}:${account.orgUuid}` : LEGACY_CACHE_KEY;
 }
-function getTokenFromCredentialsFile() {
+function fingerprint(token) {
+  return (0, import_crypto.createHash)("sha256").update(token).digest("hex").slice(0, 16);
+}
+function parseCredentials(raw) {
   try {
-    const creds = JSON.parse((0, import_fs2.readFileSync)(CREDENTIALS_FILE, "utf8"));
-    return creds?.claudeAiOauth?.accessToken ?? null;
+    const oauth = JSON.parse(raw)?.claudeAiOauth;
+    const accessToken = oauth?.accessToken;
+    if (typeof accessToken !== "string" || !accessToken) return null;
+    return {
+      accessToken,
+      expiresAt: typeof oauth?.expiresAt === "number" ? oauth.expiresAt : void 0
+    };
   } catch {
     return null;
   }
 }
-function getTokenFromKeychain() {
+function readCredentialsFile() {
+  try {
+    return parseCredentials((0, import_fs4.readFileSync)(CREDENTIALS_FILE, "utf8"));
+  } catch {
+    return null;
+  }
+}
+function readCredentialsFromKeychain() {
+  if (!IS_DEFAULT_PROFILE) return null;
   try {
     const result = (0, import_child_process.execFileSync)(
       "security",
@@ -145,83 +268,70 @@ function getTokenFromKeychain() {
         timeout: KEYCHAIN_TIMEOUT_MS
       }
     ).trim();
-    const creds = JSON.parse(result);
-    const token = creds?.claudeAiOauth?.accessToken ?? null;
-    if (token) {
-      try {
-        (0, import_fs2.mkdirSync)(CONFIG_DIR, { recursive: true });
-        (0, import_fs2.writeFileSync)(CREDENTIALS_FILE, JSON.stringify(creds, null, 2), {
-          encoding: "utf8",
-          mode: 384
-        });
-      } catch {
-      }
+    const creds = parseCredentials(result);
+    if (!creds) return null;
+    try {
+      (0, import_fs4.mkdirSync)(CONFIG_DIR, { recursive: true });
+      (0, import_fs4.writeFileSync)(CREDENTIALS_FILE, result, { encoding: "utf8", mode: 384 });
+    } catch {
     }
-    return token;
+    return creds;
   } catch {
     return null;
   }
 }
-function mtimeMs(path2) {
+function getCredentials() {
+  const fromFile = readCredentialsFile();
+  if (!IS_DEFAULT_PROFILE) return fromFile;
+  const expired = fromFile?.expiresAt !== void 0 && fromFile.expiresAt <= Date.now();
+  if (!fromFile || expired) {
+    return readCredentialsFromKeychain() ?? fromFile;
+  }
+  return fromFile;
+}
+function readStore2() {
   try {
-    return (0, import_fs2.statSync)(path2).mtimeMs;
-  } catch {
-    return null;
-  }
-}
-function credentialsFileLooksStale() {
-  const cred = mtimeMs(CREDENTIALS_FILE);
-  if (cred === null) return true;
-  const config = mtimeMs(CLAUDE_JSON2);
-  if (config === null) return false;
-  return config > cred;
-}
-function getToken(forceKeychain = false) {
-  if (process.platform !== "darwin") {
-    return getTokenFromCredentialsFile() ?? getTokenFromKeychain();
-  }
-  if (forceKeychain || credentialsFileLooksStale()) {
-    return getTokenFromKeychain() ?? getTokenFromCredentialsFile();
-  }
-  return getTokenFromCredentialsFile() ?? getTokenFromKeychain();
-}
-function readStore() {
-  try {
-    return JSON.parse((0, import_fs2.readFileSync)(CACHE_FILE, "utf8"));
+    return JSON.parse((0, import_fs4.readFileSync)(CACHE_FILE, "utf8"));
   } catch {
     return {};
   }
 }
-function writeStore(store) {
+function writeStore2(store) {
   try {
-    (0, import_fs2.mkdirSync)(CONFIG_DIR, { recursive: true });
-    (0, import_fs2.writeFileSync)(CACHE_FILE, JSON.stringify(store), "utf8");
+    (0, import_fs4.mkdirSync)(CONFIG_DIR, { recursive: true });
+    (0, import_fs4.writeFileSync)(CACHE_FILE, JSON.stringify(store), "utf8");
   } catch {
   }
 }
 function readCache(key, staleOk = false) {
-  const store = readStore();
+  const store = readStore2();
   const entry = store[key];
   if (!entry) return null;
   if (!entry.dataTimestamp) entry.dataTimestamp = entry.timestamp;
   if (!staleOk && Date.now() - entry.timestamp > CACHE_TTL_MS) return null;
   return entry;
 }
+function readVerifiedCache(key, fp, staleOk = false) {
+  const entry = readCache(key, staleOk);
+  if (!entry) return null;
+  return entry.tokenFp === fp ? entry : null;
+}
 function writeCache(key, data, options) {
-  const store = readStore();
+  const store = readStore2();
   const now = Date.now();
   const entry = {
     timestamp: now,
     dataTimestamp: options?.dataTimestamp ?? now,
     data
   };
+  if (options?.tokenFp) entry.tokenFp = options.tokenFp;
   if (options?.cooldownUntil) entry.cooldownUntil = options.cooldownUntil;
   store[key] = entry;
   if (key !== LEGACY_CACHE_KEY) store[LEGACY_CACHE_KEY] = entry;
-  writeStore(store);
+  writeStore2(store);
 }
 function isCoolingDown(key) {
-  const store = readStore();
+  const store = readStore2();
   const entry = store[key];
   return !!entry?.cooldownUntil && Date.now() < entry.cooldownUntil;
 }
@@ -241,80 +351,115 @@ function requestUsage(token) {
     headers: {
       Authorization: `Bearer ${token}`,
       "anthropic-beta": "oauth-2025-04-20"
-    }
+    },
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS2)
   });
 }
+async function resolveSession() {
+  let creds = getCredentials();
+  if (!creds) return null;
+  let fp = fingerprint(creds.accessToken);
+  let account = await resolveAccount(creds.accessToken, fp);
+  if (IS_DEFAULT_PROFILE && account && !keychainCheckedRecently(fp)) {
+    const claimed = getAccountFromConfig();
+    if (claimed && claimed.orgUuid !== account.orgUuid) {
+      const fresh = readCredentialsFromKeychain();
+      if (fresh && fresh.accessToken !== creds.accessToken) {
+        creds = fresh;
+        fp = fingerprint(fresh.accessToken);
+        account = await resolveAccount(fresh.accessToken, fp);
+      } else {
+        markKeychainChecked(fp);
+      }
+    }
+  }
+  return { creds, fp, account };
+}
 async function fetchUsage() {
-  const account = getAccount();
-  const key = cacheKey(account);
-  const withAccount = (v) => ({ ...v, account });
+  let resolved = null;
   try {
-    const cached = readCache(key);
+    const session = await resolveSession();
+    if (!session) return null;
+    let { creds, fp, account } = session;
+    let key = cacheKey(account);
+    resolved = { key, fp, account };
+    const withAccount = (v) => ({ ...v, account });
+    const cached = readVerifiedCache(key, fp);
     if (cached) return withAccount(parseUsageResponse(cached.data));
-    if (isCoolingDown(key)) {
-      const stale = readCache(key, true);
+    if (isCoolingDown(key) || isTokenBlocked(fp)) {
+      const stale = readVerifiedCache(key, fp, true);
       return stale ? withAccount(parseUsageResponse(stale.data)) : null;
     }
-    let token = getToken();
-    if (!token) return null;
-    let res = await requestUsage(token);
-    if (res.status === 401) {
-      const fresh = getToken(true);
-      if (fresh && fresh !== token) {
-        token = fresh;
-        res = await requestUsage(token);
+    let res = await requestUsage(creds.accessToken);
+    if (res.status === 401 && IS_DEFAULT_PROFILE) {
+      blockToken(fp);
+      const fresh = readCredentialsFromKeychain();
+      if (fresh && fresh.accessToken !== creds.accessToken) {
+        creds = fresh;
+        fp = fingerprint(fresh.accessToken);
+        account = await resolveAccount(fresh.accessToken, fp);
+        key = cacheKey(account);
+        resolved = { key, fp, account };
+        res = await requestUsage(fresh.accessToken);
       }
     }
     if (!res.ok) {
-      const stale = readCache(key, true);
+      const stale = readVerifiedCache(key, fp, true);
       const staleData = stale?.data;
       const isStaleUsable = staleData && stale && Date.now() - stale.dataTimestamp < MAX_STALE_MS;
+      if (res.status === 401 || res.status === 403) blockToken(fp);
       if (res.status === 429) {
-        const retryAfter = res.headers.get("retry-after");
-        const cooldownMs = retryAfter ? parseInt(retryAfter, 10) * 1e3 : 6e5;
+        const seconds = Number.parseInt(res.headers.get("retry-after") ?? "", 10);
+        const cooldownMs = Number.isFinite(seconds) && seconds > 0 ? Math.min(Math.max(seconds * 1e3, MIN_COOLDOWN_MS), MAX_COOLDOWN_MS) : DEFAULT_COOLDOWN_MS;
         writeCache(key, staleData ?? {}, {
           cooldownUntil: Date.now() + cooldownMs,
-          dataTimestamp: stale?.dataTimestamp ?? 0
+          dataTimestamp: stale?.dataTimestamp ?? 0,
+          tokenFp: staleData ? fp : void 0
         });
       } else if (isStaleUsable) {
-        writeCache(key, staleData, { dataTimestamp: stale.dataTimestamp });
+        writeCache(key, staleData, {
+          dataTimestamp: stale.dataTimestamp,
+          tokenFp: fp
+        });
       }
       return staleData?.five_hour || staleData?.seven_day ? withAccount(parseUsageResponse(staleData)) : null;
     }
     const data = await res.json();
-    writeCache(key, data);
+    writeCache(key, data, { tokenFp: fp });
     return withAccount(parseUsageResponse(data));
   } catch {
-    const stale = readCache(key, true);
-    if (stale) {
-      if (Date.now() - stale.dataTimestamp < MAX_STALE_MS) {
-        writeCache(key, stale.data, { dataTimestamp: stale.dataTimestamp });
-      }
-      return withAccount(parseUsageResponse(stale.data));
+    if (!resolved) return null;
+    const stale = readVerifiedCache(resolved.key, resolved.fp, true);
+    if (!stale) return null;
+    if (Date.now() - stale.dataTimestamp < MAX_STALE_MS) {
+      writeCache(resolved.key, stale.data, {
+        dataTimestamp: stale.dataTimestamp,
+        tokenFp: stale.tokenFp
+      });
     }
-    return null;
+    return { ...parseUsageResponse(stale.data), account: resolved.account };
   }
 }
 
 // src/setup.ts
-var import_fs3 = require("fs");
+var import_fs5 = require("fs");
 var import_path3 = require("path");
-var import_os3 = require("os");
-var SETTINGS_PATH = (0, import_path3.join)((0, import_os3.homedir)(), ".claude", "settings.json");
+var import_os2 = require("os");
+var SETTINGS_PATH = (0, import_path3.join)((0, import_os2.homedir)(), ".claude", "settings.json");
 var STATUSLINE_COMMAND = "usage-statusbar";
 function readSettings() {
   try {
-    return JSON.parse((0, import_fs3.readFileSync)(SETTINGS_PATH, "utf8"));
+    return JSON.parse((0, import_fs5.readFileSync)(SETTINGS_PATH, "utf8"));
   } catch {
     return {};
   }
 }
 function writeSettings(settings) {
-  const dir = (0, import_path3.join)((0, import_os3.homedir)(), ".claude");
-  if (!(0, import_fs3.existsSync)(dir)) {
-    (0, import_fs3.mkdirSync)(dir, { recursive: true });
+  const dir = (0, import_path3.join)((0, import_os2.homedir)(), ".claude");
+  if (!(0, import_fs5.existsSync)(dir)) {
+    (0, import_fs5.mkdirSync)(dir, { recursive: true });
   }
-  (0, import_fs3.writeFileSync)(SETTINGS_PATH, JSON.stringify(settings, null, 2) + "\n");
+  (0, import_fs5.writeFileSync)(SETTINGS_PATH, JSON.stringify(settings, null, 2) + "\n");
 }
 function applySettings() {
   const settings = readSettings();
