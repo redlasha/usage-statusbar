@@ -69,6 +69,15 @@ export function renderModel(displayName: string): string {
   return `${color}${displayName}${ANSI.reset}`;
 }
 
+/**
+ * 프롬프트 캐시 히트율. hit_ratio는 높을수록 좋으므로 usage 바와 색 기준이 반대다.
+ */
+export function renderCacheHitRatio(hitRatio: number): string {
+  const pct = Math.round(Math.min(1, Math.max(0, hitRatio)) * 100);
+  const color = pct >= 80 ? ANSI.green : pct >= 50 ? ANSI.yellow : ANSI.red;
+  return `${color}💾${pct}%${ANSI.reset}`;
+}
+
 export function formatDuration(ms: number): string {
   if (ms <= 0) return "0";
 

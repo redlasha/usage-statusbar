@@ -65,6 +65,11 @@ function renderModel(displayName) {
   else if (name.includes("fable") || name.includes("haiku")) color = ANSI.green;
   return `${color}${displayName}${ANSI.reset}`;
 }
+function renderCacheHitRatio(hitRatio) {
+  const pct = Math.round(Math.min(1, Math.max(0, hitRatio)) * 100);
+  const color = pct >= 80 ? ANSI.green : pct >= 50 ? ANSI.yellow : ANSI.red;
+  return `${color}\u{1F4BE}${pct}%${ANSI.reset}`;
+}
 function formatDuration(ms) {
   if (ms <= 0) return "0";
   const hours = ms / 36e5;
@@ -589,8 +594,12 @@ async function statusline() {
   const cwd = input.workspace?.current_dir ?? input.cwd ?? process.cwd();
   const wt = detectWorktree(cwd);
   const wtPrefix = wt.isWorktree ? `\u{1F33F} ${wt.branch ?? "wt"} ` : "";
+  const sessionName = input.session_name?.trim();
+  const sessionPrefix = sessionName ? `\u{1F3F7}\uFE0F ${sessionName} ` : "";
   const modelName = input.model?.display_name;
   const modelPrefix = modelName ? `${renderModel(modelName)} ` : "";
+  const hitRatio = input.prompt_cache?.hit_ratio;
+  const cachePrefix = hitRatio !== void 0 ? `${renderCacheHitRatio(hitRatio)} ` : "";
   const usage = await fetchUsage(input.rate_limits);
   if (usage) {
     const acct = renderAccount(usage.account);
@@ -598,10 +607,12 @@ async function statusline() {
     const resetTime = formatDuration(usage.fiveHourResetMs);
     const resetKST = usage.fiveHourResetAt ? formatHourKST(usage.fiveHourResetAt) : "";
     console.log(
-      `${wtPrefix}${acct}${modelPrefix}\u{1F9E0} ${contextBar}${Math.round(contextPct)}% \u23F0 ${blockBar}${Math.round(usage.fiveHourPct)}% \u{1F504} ${resetKST}(-${resetTime})`
+      `${wtPrefix}\u23F0 ${blockBar}${Math.round(usage.fiveHourPct)}% \u{1F504} ${resetKST}(-${resetTime}) \u{1F9E0} ${contextBar}${Math.round(contextPct)}% ${sessionPrefix}${modelPrefix}${acct}${cachePrefix}`.trimEnd()
     );
   } else {
-    console.log(`${wtPrefix}${modelPrefix}\u{1F9E0} ${contextBar}${Math.round(contextPct)}%`);
+    console.log(
+      `${wtPrefix}\u{1F9E0} ${contextBar}${Math.round(contextPct)}% ${sessionPrefix}${modelPrefix}${cachePrefix}`.trimEnd()
+    );
   }
 }
 async function main() {

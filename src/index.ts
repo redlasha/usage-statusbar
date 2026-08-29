@@ -2,7 +2,7 @@
 
 import * as fs from "fs";
 import * as path from "path";
-import { renderBar, renderAccount, renderModel, formatDuration } from "./render";
+import { renderBar, renderAccount, renderModel, renderCacheHitRatio, formatDuration } from "./render";
 import { fetchUsage, type RateLimits } from "./usage-api";
 import { setup, remove } from "./setup";
 
@@ -11,6 +11,8 @@ type StatusLineInput = {
     used_percentage?: number;
   };
   cwd?: string;
+  /** `--name` / `/rename`으로 설정했거나 AI가 생성한 제목이 있을 때만 존재 */
+  session_name?: string;
   workspace?: {
     current_dir?: string;
   };
@@ -23,6 +25,10 @@ type StatusLineInput = {
    * (anthropic-ratelimit-unified-*)에서 나오므로 조회 비용이 없고 항상 최신이다.
    */
   rate_limits?: RateLimits;
+  /** 메인 대화의 프롬프트 캐시 통계. 세션 첫 API 응답 이후부터 존재 */
+  prompt_cache?: {
+    hit_ratio?: number;
+  };
 };
 
 /**
@@ -119,9 +125,17 @@ async function statusline() {
     ? `🌿 ${wt.branch ?? "wt"} `
     : "";
 
+  // 세션명 (세션 간 메시지 주고받을 때 어느 세션인지 구분용)
+  const sessionName = input.session_name?.trim();
+  const sessionPrefix = sessionName ? `🏷️ ${sessionName} ` : "";
+
   // 모델명 (비용 등급별 색상)
   const modelName = input.model?.display_name;
   const modelPrefix = modelName ? `${renderModel(modelName)} ` : "";
+
+  // 프롬프트 캐시 히트율
+  const hitRatio = input.prompt_cache?.hit_ratio;
+  const cachePrefix = hitRatio !== undefined ? `${renderCacheHitRatio(hitRatio)} ` : "";
 
   // 5-hour block usage — stdin에 실려오면 그걸 쓰고, 없을 때만 API 조회
   const usage = await fetchUsage(input.rate_limits);
@@ -136,10 +150,12 @@ async function statusline() {
       : "";
 
     console.log(
-      `${wtPrefix}${acct}${modelPrefix}🧠 ${contextBar}${Math.round(contextPct)}% ⏰ ${blockBar}${Math.round(usage.fiveHourPct)}% 🔄 ${resetKST}(-${resetTime})`
+      `${wtPrefix}⏰ ${blockBar}${Math.round(usage.fiveHourPct)}% 🔄 ${resetKST}(-${resetTime}) 🧠 ${contextBar}${Math.round(contextPct)}% ${sessionPrefix}${modelPrefix}${acct}${cachePrefix}`.trimEnd()
     );
   } else {
-    console.log(`${wtPrefix}${modelPrefix}🧠 ${contextBar}${Math.round(contextPct)}%`);
+    console.log(
+      `${wtPrefix}🧠 ${contextBar}${Math.round(contextPct)}% ${sessionPrefix}${modelPrefix}${cachePrefix}`.trimEnd()
+    );
   }
 }
 

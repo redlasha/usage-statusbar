@@ -3,18 +3,22 @@
 Claude Code statusline that shows what matters for subscription users.
 
 ```
-🌿 my-branch 👤1·personal Opus 5 🧠 ██░░░42% ⏰ ███░░53% 🔄 PM8:30(-1.4)
+🌿 my-branch ⏰ ███░░53% 🔄 PM8:30(-1.4) 🧠 ██░░░42% 🏷️ my-session Opus 5 👤1·personal 💾91%
 ```
 
 - **🌿 Worktree** — branch name, only inside a git worktree
-- **👤 Account** — which account this session runs as, only if more than one is set up
-- **Model** — the main-loop model, colored by family
-- **🧠 Context** — context window usage %
 - **⏰ Usage** — 5-hour block usage %
 - **🔄 Reset** — reset time (KST) and hours remaining
+- **🧠 Context** — context window usage %
+- **🏷️ Session** — session name, only once one is set
+- **Model** — the main-loop model, colored by family
+- **👤 Account** — which account this session runs as, only if more than one is set up
+- **💾 Cache** — prompt cache hit ratio, only once available
 
-Sections that do not apply are omitted, so a single-account session in a plain checkout
-shows just the last three.
+Sections lead with what's most likely to make you stop and look — usage and reset —
+then context, and the rest in decreasing order of urgency. Sections that do not apply are
+omitted, so a single-account session in a plain checkout with no name set shows just
+usage, reset, context, and model.
 
 ## Why
 
@@ -55,11 +59,29 @@ usage-statusbar --remove   # take it back out
 | Section | Source | Description |
 |---------|--------|-------------|
 | 🌿 Worktree | cwd | Branch name, shown only inside a git worktree |
-| 👤 Account | OAuth token | Which account this session runs as (see below) |
-| Model | Claude Code stdin | Main-loop model, colored by family (opus / sonnet / fable-haiku) |
-| 🧠 Context | Claude Code stdin | Context window usage percentage |
 | ⏰ Usage | Claude Code stdin (OAuth API fallback) | 5-hour rolling block utilization |
 | 🔄 Reset | Claude Code stdin (OAuth API fallback) | Next reset time (KST) and hours remaining |
+| 🧠 Context | Claude Code stdin | Context window usage percentage |
+| 🏷️ Session | Claude Code stdin | Session name, shown only when set |
+| Model | Claude Code stdin | Main-loop model, colored by family (opus / sonnet / fable-haiku) |
+| 👤 Account | OAuth token | Which account this session runs as (see below) |
+| 💾 Cache | Claude Code stdin | Prompt cache hit ratio, shown only once available |
+
+### Session name
+
+Useful when you have several sessions running at once and send messages between them —
+the statusline tells you which session you're looking at. Shown only when the session
+has a name (`session_name` in the stdin JSON, set with `--name`, `/rename`, or an
+AI-generated title); the default `my-app-3f`-style name doesn't count, so most sessions
+omit this section.
+
+### Cache hit ratio
+
+Claude Code tracks prompt cache performance for the main conversation and reports it via
+`prompt_cache.hit_ratio` once the first API response comes back (Claude Code v2.1.251+).
+A high ratio (green, ≥80%) means most of the context is being served from cache; a low
+one (red, <50%) means the cache keeps going cold, which shows up as slower responses
+regardless of cost. Absent until that first response, or on older Claude Code versions.
 
 ### Account indicator
 
@@ -99,7 +121,9 @@ rather than serving the previous account's quota until the cache expires.
 
 Bars are 5 cells of `█` (filled) / `░` (empty) — single-width Unicode, works on all
 terminals. The thresholds apply to the 🧠 and ⏰ bars; the model name is colored by
-family instead — opus red, sonnet yellow, fable/haiku green, anything else dim.
+family instead — opus red, sonnet yellow, fable/haiku green, anything else dim. 💾 uses
+the same three colors but inverted, since a high hit ratio is good: green ≥80%, yellow
+50-79%, red below 50%.
 
 ## How it works
 
