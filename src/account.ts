@@ -28,15 +28,31 @@ function shortLabel(orgName: string): string {
   return orgName.length > 12 ? `${orgName.slice(0, 12)}…` : orgName;
 }
 
-/** claude-swap 스토어에서 orgUuid → 슬롯 번호 역인덱싱 (없으면 조용히 무시) */
-function findSlot(orgUuid: string): number | null {
+/**
+ * 프로세스 수명 안에서만 유효한 캐시.
+ * 한 렌더 안에서 toAccount()가 여러 번 불릴 수 있어(org 불일치 재확인 등)
+ * 같은 파일을 매번 다시 읽지 않게 한다. statusline은 렌더마다 새 프로세스라
+ * 다음 렌더에는 자연히 다시 읽는다.
+ */
+let cachedSwapSequence: any = undefined;
+
+function loadSwapSequence(): any {
+  if (cachedSwapSequence !== undefined) return cachedSwapSequence;
   try {
-    const seq = JSON.parse(readFileSync(SWAP_SEQUENCE, "utf8"));
-    for (const [num, acct] of Object.entries<any>(seq?.accounts ?? {})) {
-      if (acct?.organizationUuid === orgUuid) return Number(num);
-    }
+    cachedSwapSequence = JSON.parse(readFileSync(SWAP_SEQUENCE, "utf8"));
   } catch {
     // claude-swap을 안 쓰는 환경
+    cachedSwapSequence = null;
+  }
+  return cachedSwapSequence;
+}
+
+/** claude-swap 스토어에서 orgUuid → 슬롯 번호 역인덱싱 (없으면 조용히 무시) */
+function findSlot(orgUuid: string): number | null {
+  const seq = loadSwapSequence();
+  if (!seq) return null;
+  for (const [num, acct] of Object.entries<any>(seq?.accounts ?? {})) {
+    if (acct?.organizationUuid === orgUuid) return Number(num);
   }
   return null;
 }

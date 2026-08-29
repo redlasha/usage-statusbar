@@ -1,7 +1,8 @@
-import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { join } from "path";
 import { CONFIG_DIR } from "./profile";
 import { toAccount, getAccountFromConfig, type Account } from "./account";
+import { readJsonStore, writeJsonStore } from "./kv-store";
+import { oauthFetch } from "./oauth";
 
 /**
  * access token → 계정 확정.
@@ -15,7 +16,6 @@ import { toAccount, getAccountFromConfig, type Account } from "./account";
  */
 
 const IDENTITY_FILE = join(CONFIG_DIR, ".claude-identity-cache.json");
-const REQUEST_TIMEOUT_MS = 3000;
 
 /**
  * 인증이 거절된 토큰을 다시 시도하기까지의 간격.
@@ -34,6 +34,12 @@ const AUTH_BACKOFF_MS = 600_000; // 10 minutes
  */
 const KEYCHAIN_RECHECK_MS = 60_000;
 
+/**
+ * 로컬 자격증명 파일이 없거나 만료됐을 때 Keychain을 확인하는 간격.
+ * tokenFp로 구분되지 않는 상황(파일 자체가 없거나 만료됨)이라 고정 키를 쓴다.
+ */
+const NO_CREDENTIALS_KEY = "__no_credentials__";
+
 /** 성공하면 org를, 인증이 거절되면 재시도 시각을 기록한다 */
 type TokenState = {
   orgUuid?: string;
@@ -42,27 +48,15 @@ type TokenState = {
   /** 이 토큰 기준으로 Keychain을 확인해봤자 소용없다고 판명된 시각까지 */
   keychainCheckedUntil?: number;
 };
-/** tokenFp → state */
+/** tokenFp → state (NO_CREDENTIALS_KEY도 같은 스토어를 공유) */
 type TokenStore = Record<string, TokenState>;
 
 function readStore(): TokenStore {
-  try {
-    return JSON.parse(readFileSync(IDENTITY_FILE, "utf8"));
-  } catch {
-    return {};
-  }
+  return readJsonStore<TokenState>(IDENTITY_FILE);
 }
 
 function writeStore(store: TokenStore): void {
-  try {
-    mkdirSync(CONFIG_DIR, { recursive: true });
-    writeFileSync(IDENTITY_FILE, JSON.stringify(store), {
-      encoding: "utf8",
-      mode: 0o600,
-    });
-  } catch {
-    // Ignore write errors
-  }
+  writeJsonStore(CONFIG_DIR, IDENTITY_FILE, store, 0o600);
 }
 
 /** 지문은 토큰 수명만큼만 유효하므로 무한정 쌓이지 않게 최근 것만 남긴다 */
@@ -99,18 +93,24 @@ export function keychainCheckedRecently(tokenFp: string): boolean {
   );
 }
 
+/**
+ * 로컬 자격증명 파일이 없거나 만료된 상태에서 Keychain을 확인했다.
+ * 세션이 idle해서 파일이 계속 만료 상태로 남아 있어도 렌더마다 다시 묻지 않는다.
+ */
+export function markNoCredentialsKeychainChecked(): void {
+  putState(NO_CREDENTIALS_KEY, { keychainCheckedUntil: Date.now() + KEYCHAIN_RECHECK_MS });
+}
+
+export function noCredentialsKeychainCheckedRecently(): boolean {
+  return keychainCheckedRecently(NO_CREDENTIALS_KEY);
+}
+
 /** null = 확정 실패, "unauthorized" = 토큰이 거절됨 */
 async function fetchIdentity(
   token: string
 ): Promise<TokenState | "unauthorized" | null> {
   try {
-    const res = await fetch("https://api.anthropic.com/api/oauth/profile", {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "anthropic-beta": "oauth-2025-04-20",
-      },
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
+    const res = await oauthFetch("https://api.anthropic.com/api/oauth/profile", token);
     if (res.status === 401 || res.status === 403) return "unauthorized";
     if (!res.ok) return null;
 

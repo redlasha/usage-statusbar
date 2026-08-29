@@ -8,6 +8,8 @@ import {
   isTokenBlocked,
   markKeychainChecked,
   keychainCheckedRecently,
+  markNoCredentialsKeychainChecked,
+  noCredentialsKeychainCheckedRecently,
 } from "./identity";
 import {
   CACHE_FILE,
@@ -15,10 +17,11 @@ import {
   CREDENTIALS_FILE,
   IS_DEFAULT_PROFILE,
 } from "./profile";
+import { readJsonStore, writeJsonStore } from "./kv-store";
+import { oauthFetch } from "./oauth";
 
 const CACHE_TTL_MS = 300_000; // 5 minutes
 const MAX_STALE_MS = 3_600_000; // 1 hour — stale data older than this is discarded
-const REQUEST_TIMEOUT_MS = 3000; // statusline은 매 렌더 호출되므로 매달리면 안 된다
 
 /**
  * 429 쿨다운 범위.
@@ -166,6 +169,10 @@ function readCredentialsFromKeychain(): Credentials | null {
  *
  * 별도 프로필에서는 자기 .credentials.json만이 정본이다. 파일이 없다고 Keychain으로
  * 폴백하면 전역 활성 계정 토큰을 집어오게 되므로, 차라리 usage 표시를 포기한다.
+ *
+ * 파일이 없거나 만료된 상태는 세션이 idle하면 렌더마다 반복될 수 있다. 다른
+ * Keychain 호출부(markKeychainChecked 등)처럼 여기도 재확인 간격을 둬서, 매 렌더
+ * `security` 서브프로세스를 다시 부르지 않게 한다.
  */
 function getCredentials(): Credentials | null {
   const fromFile = readCredentialsFile();
@@ -174,26 +181,20 @@ function getCredentials(): Credentials | null {
   const expired =
     fromFile?.expiresAt !== undefined && fromFile.expiresAt <= Date.now();
   if (!fromFile || expired) {
-    return readCredentialsFromKeychain() ?? fromFile;
+    if (noCredentialsKeychainCheckedRecently()) return fromFile;
+    const fresh = readCredentialsFromKeychain();
+    markNoCredentialsKeychainChecked();
+    return fresh ?? fromFile;
   }
   return fromFile;
 }
 
 function readStore(): CacheStore {
-  try {
-    return JSON.parse(readFileSync(CACHE_FILE, "utf8"));
-  } catch {
-    return {};
-  }
+  return readJsonStore<CacheEntry>(CACHE_FILE);
 }
 
 function writeStore(store: CacheStore): void {
-  try {
-    mkdirSync(CONFIG_DIR, { recursive: true });
-    writeFileSync(CACHE_FILE, JSON.stringify(store), "utf8");
-  } catch {
-    // Ignore write errors
-  }
+  writeJsonStore(CONFIG_DIR, CACHE_FILE, store);
 }
 
 function readCache(key: string, staleOk = false): CacheEntry | null {
@@ -298,13 +299,25 @@ function parseRateLimits(limits: RateLimits) {
 }
 
 function requestUsage(token: string): Promise<Response> {
-  return fetch("https://api.anthropic.com/api/oauth/usage", {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "anthropic-beta": "oauth-2025-04-20",
-    },
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-  });
+  return oauthFetch("https://api.anthropic.com/api/oauth/usage", token);
+}
+
+/**
+ * Keychain에서 새 토큰을 받아 creds/fp/account를 다시 확정한다.
+ * 갱신할 게 없으면(Keychain도 같은 토큰이거나 비어있으면) null.
+ *
+ * resolveSession()의 org 불일치 재확인과 fetchUsage()의 401 재시도가 똑같이
+ * "Keychain에서 새 토큰 받아서 fp/account 재계산"을 하길래 하나로 뺐다.
+ */
+async function refreshFromKeychain(
+  creds: Credentials
+): Promise<{ creds: Credentials; fp: string; account: Account | null } | null> {
+  const fresh = readCredentialsFromKeychain();
+  if (!fresh || fresh.accessToken === creds.accessToken) return null;
+
+  const fp = fingerprint(fresh.accessToken);
+  const account = await resolveAccount(fresh.accessToken, fp);
+  return { creds: fresh, fp, account };
 }
 
 /**
@@ -329,11 +342,9 @@ async function resolveSession(): Promise<{
   if (IS_DEFAULT_PROFILE && account && !keychainCheckedRecently(fp)) {
     const claimed = getAccountFromConfig();
     if (claimed && claimed.orgUuid !== account.orgUuid) {
-      const fresh = readCredentialsFromKeychain();
-      if (fresh && fresh.accessToken !== creds.accessToken) {
-        creds = fresh;
-        fp = fingerprint(fresh.accessToken);
-        account = await resolveAccount(fresh.accessToken, fp);
+      const refreshed = await refreshFromKeychain(creds);
+      if (refreshed) {
+        ({ creds, fp, account } = refreshed);
       } else {
         // Keychain에도 새 토큰이 없다 — .claude.json 쪽이 틀린 것이니 그만 묻는다
         markKeychainChecked(fp);
@@ -399,14 +410,12 @@ export async function fetchUsage(rateLimits?: RateLimits): Promise<{
     // 그림자 파일 토큰이 폐기됐을 수 있다 — 기본 프로필이면 Keychain으로 한 번만 재시도
     if (res.status === 401 && IS_DEFAULT_PROFILE) {
       blockToken(fp); // 이 토큰은 확실히 죽었다
-      const fresh = readCredentialsFromKeychain();
-      if (fresh && fresh.accessToken !== creds.accessToken) {
-        creds = fresh;
-        fp = fingerprint(fresh.accessToken);
-        account = await resolveAccount(fresh.accessToken, fp);
+      const refreshed = await refreshFromKeychain(creds);
+      if (refreshed) {
+        ({ creds, fp, account } = refreshed);
         key = cacheKey(account);
         resolved = { key, fp, account };
-        res = await requestUsage(fresh.accessToken);
+        res = await requestUsage(creds.accessToken);
       }
     }
 

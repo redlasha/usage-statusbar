@@ -115,13 +115,21 @@ function shortLabel(orgName) {
   if (/'s Organization$/.test(orgName)) return "personal";
   return orgName.length > 12 ? `${orgName.slice(0, 12)}\u2026` : orgName;
 }
-function findSlot(orgUuid) {
+var cachedSwapSequence = void 0;
+function loadSwapSequence() {
+  if (cachedSwapSequence !== void 0) return cachedSwapSequence;
   try {
-    const seq = JSON.parse((0, import_fs2.readFileSync)(SWAP_SEQUENCE, "utf8"));
-    for (const [num, acct] of Object.entries(seq?.accounts ?? {})) {
-      if (acct?.organizationUuid === orgUuid) return Number(num);
-    }
+    cachedSwapSequence = JSON.parse((0, import_fs2.readFileSync)(SWAP_SEQUENCE, "utf8"));
   } catch {
+    cachedSwapSequence = null;
+  }
+  return cachedSwapSequence;
+}
+function findSlot(orgUuid) {
+  const seq = loadSwapSequence();
+  if (!seq) return null;
+  for (const [num, acct] of Object.entries(seq?.accounts ?? {})) {
+    if (acct?.organizationUuid === orgUuid) return Number(num);
   }
   return null;
 }
@@ -146,28 +154,51 @@ function getAccountFromConfig() {
 }
 
 // src/identity.ts
-var import_fs3 = require("fs");
 var import_path2 = require("path");
-var IDENTITY_FILE = (0, import_path2.join)(CONFIG_DIR, ".claude-identity-cache.json");
-var REQUEST_TIMEOUT_MS = 3e3;
-var AUTH_BACKOFF_MS = 6e5;
-var KEYCHAIN_RECHECK_MS = 6e4;
-function readStore() {
+
+// src/kv-store.ts
+var import_fs3 = require("fs");
+function readJsonStore(file) {
   try {
-    return JSON.parse((0, import_fs3.readFileSync)(IDENTITY_FILE, "utf8"));
+    return JSON.parse((0, import_fs3.readFileSync)(file, "utf8"));
   } catch {
     return {};
   }
 }
-function writeStore(store) {
+function writeJsonStore(dir, file, store, mode) {
   try {
-    (0, import_fs3.mkdirSync)(CONFIG_DIR, { recursive: true });
-    (0, import_fs3.writeFileSync)(IDENTITY_FILE, JSON.stringify(store), {
-      encoding: "utf8",
-      mode: 384
-    });
+    (0, import_fs3.mkdirSync)(dir, { recursive: true });
+    if (mode !== void 0) {
+      (0, import_fs3.writeFileSync)(file, JSON.stringify(store), { encoding: "utf8", mode });
+    } else {
+      (0, import_fs3.writeFileSync)(file, JSON.stringify(store), "utf8");
+    }
   } catch {
   }
+}
+
+// src/oauth.ts
+var OAUTH_REQUEST_TIMEOUT_MS = 3e3;
+function oauthFetch(url, token) {
+  return fetch(url, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "anthropic-beta": "oauth-2025-04-20"
+    },
+    signal: AbortSignal.timeout(OAUTH_REQUEST_TIMEOUT_MS)
+  });
+}
+
+// src/identity.ts
+var IDENTITY_FILE = (0, import_path2.join)(CONFIG_DIR, ".claude-identity-cache.json");
+var AUTH_BACKOFF_MS = 6e5;
+var KEYCHAIN_RECHECK_MS = 6e4;
+var NO_CREDENTIALS_KEY = "__no_credentials__";
+function readStore() {
+  return readJsonStore(IDENTITY_FILE);
+}
+function writeStore(store) {
+  writeJsonStore(CONFIG_DIR, IDENTITY_FILE, store, 384);
 }
 function putState(fp, patch) {
   const store = readStore();
@@ -191,15 +222,15 @@ function keychainCheckedRecently(tokenFp) {
   const state = readStore()[tokenFp];
   return !!state?.keychainCheckedUntil && Date.now() < state.keychainCheckedUntil;
 }
+function markNoCredentialsKeychainChecked() {
+  putState(NO_CREDENTIALS_KEY, { keychainCheckedUntil: Date.now() + KEYCHAIN_RECHECK_MS });
+}
+function noCredentialsKeychainCheckedRecently() {
+  return keychainCheckedRecently(NO_CREDENTIALS_KEY);
+}
 async function fetchIdentity(token) {
   try {
-    const res = await fetch("https://api.anthropic.com/api/oauth/profile", {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "anthropic-beta": "oauth-2025-04-20"
-      },
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
-    });
+    const res = await oauthFetch("https://api.anthropic.com/api/oauth/profile", token);
     if (res.status === 401 || res.status === 403) return "unauthorized";
     if (!res.ok) return null;
     const data = await res.json();
@@ -229,7 +260,6 @@ async function resolveAccount(token, tokenFp) {
 // src/usage-api.ts
 var CACHE_TTL_MS = 3e5;
 var MAX_STALE_MS = 36e5;
-var REQUEST_TIMEOUT_MS2 = 3e3;
 var MIN_COOLDOWN_MS = 3e4;
 var MAX_COOLDOWN_MS = 18e5;
 var DEFAULT_COOLDOWN_MS = 6e5;
@@ -290,23 +320,18 @@ function getCredentials() {
   if (!IS_DEFAULT_PROFILE) return fromFile;
   const expired = fromFile?.expiresAt !== void 0 && fromFile.expiresAt <= Date.now();
   if (!fromFile || expired) {
-    return readCredentialsFromKeychain() ?? fromFile;
+    if (noCredentialsKeychainCheckedRecently()) return fromFile;
+    const fresh = readCredentialsFromKeychain();
+    markNoCredentialsKeychainChecked();
+    return fresh ?? fromFile;
   }
   return fromFile;
 }
 function readStore2() {
-  try {
-    return JSON.parse((0, import_fs4.readFileSync)(CACHE_FILE, "utf8"));
-  } catch {
-    return {};
-  }
+  return readJsonStore(CACHE_FILE);
 }
 function writeStore2(store) {
-  try {
-    (0, import_fs4.mkdirSync)(CONFIG_DIR, { recursive: true });
-    (0, import_fs4.writeFileSync)(CACHE_FILE, JSON.stringify(store), "utf8");
-  } catch {
-  }
+  writeJsonStore(CONFIG_DIR, CACHE_FILE, store);
 }
 function readCache(key, staleOk = false) {
   const store = readStore2();
@@ -374,13 +399,14 @@ function parseRateLimits(limits) {
   };
 }
 function requestUsage(token) {
-  return fetch("https://api.anthropic.com/api/oauth/usage", {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "anthropic-beta": "oauth-2025-04-20"
-    },
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS2)
-  });
+  return oauthFetch("https://api.anthropic.com/api/oauth/usage", token);
+}
+async function refreshFromKeychain(creds) {
+  const fresh = readCredentialsFromKeychain();
+  if (!fresh || fresh.accessToken === creds.accessToken) return null;
+  const fp = fingerprint(fresh.accessToken);
+  const account = await resolveAccount(fresh.accessToken, fp);
+  return { creds: fresh, fp, account };
 }
 async function resolveSession() {
   let creds = getCredentials();
@@ -390,11 +416,9 @@ async function resolveSession() {
   if (IS_DEFAULT_PROFILE && account && !keychainCheckedRecently(fp)) {
     const claimed = getAccountFromConfig();
     if (claimed && claimed.orgUuid !== account.orgUuid) {
-      const fresh = readCredentialsFromKeychain();
-      if (fresh && fresh.accessToken !== creds.accessToken) {
-        creds = fresh;
-        fp = fingerprint(fresh.accessToken);
-        account = await resolveAccount(fresh.accessToken, fp);
+      const refreshed = await refreshFromKeychain(creds);
+      if (refreshed) {
+        ({ creds, fp, account } = refreshed);
       } else {
         markKeychainChecked(fp);
       }
@@ -429,14 +453,12 @@ async function fetchUsage(rateLimits) {
     let res = await requestUsage(creds.accessToken);
     if (res.status === 401 && IS_DEFAULT_PROFILE) {
       blockToken(fp);
-      const fresh = readCredentialsFromKeychain();
-      if (fresh && fresh.accessToken !== creds.accessToken) {
-        creds = fresh;
-        fp = fingerprint(fresh.accessToken);
-        account = await resolveAccount(fresh.accessToken, fp);
+      const refreshed = await refreshFromKeychain(creds);
+      if (refreshed) {
+        ({ creds, fp, account } = refreshed);
         key = cacheKey(account);
         resolved = { key, fp, account };
-        res = await requestUsage(fresh.accessToken);
+        res = await requestUsage(creds.accessToken);
       }
     }
     if (!res.ok) {
